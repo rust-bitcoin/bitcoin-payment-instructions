@@ -63,11 +63,8 @@ pub mod receive;
 
 pub mod hrn_resolution;
 
-pub mod hrn;
-
 use amount::Amount;
-use hrn::HumanReadableName;
-use hrn_resolution::{HrnResolution, HrnResolver};
+use hrn_resolution::{HrnResolution, HrnResolver, HumanReadableName};
 
 /// A method which can be used to make a payment
 #[derive(Clone, Debug, PartialEq, Eq)]

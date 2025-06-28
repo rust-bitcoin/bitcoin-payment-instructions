@@ -9,9 +9,8 @@ use dnssec_prover::rr::Name;
 
 use crate::amount::Amount;
 use crate::dnssec_utils::resolve_proof;
-use crate::hrn::HumanReadableName;
 use crate::hrn_resolution::{
-	HrnResolution, HrnResolutionFuture, HrnResolver, LNURLResolutionFuture,
+	HrnResolution, HrnResolutionFuture, HrnResolver, HumanReadableName, LNURLResolutionFuture,
 };
 
 /// An [`HrnResolver`] which resolves BIP 353 Human Readable Names to payment instructions using a
@@ -52,7 +51,7 @@ mod tests {
 	use crate::*;
 
 	#[tokio::test]
-	async fn test_http_hrn_resolver() {
+	async fn test_dns_hrn_resolver() {
 		let resolver = DNSHrnResolver(SocketAddr::from_str("8.8.8.8:53").unwrap());
 		let instructions = PaymentInstructions::parse(
 			"send.some@satsto.me",

@@ -7,9 +7,10 @@
 //! associated types in this module.
 
 use crate::amount::Amount;
-use crate::hrn::HumanReadableName;
 
 use lightning_invoice::Bolt11Invoice;
+
+pub use lightning::onion_message::dns_resolution::HumanReadableName;
 
 use core::future::Future;
 use core::pin::Pin;
