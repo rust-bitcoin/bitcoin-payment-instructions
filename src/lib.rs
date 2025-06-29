@@ -57,6 +57,9 @@ pub mod dns_resolver;
 #[cfg(feature = "http")]
 pub mod http_resolver;
 
+#[cfg(feature = "std")] // TODO: Drop once we upgrade to LDK 0.2
+pub mod onion_message_resolver;
+
 pub mod amount;
 
 pub mod receive;

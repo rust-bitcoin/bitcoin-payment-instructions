@@ -13,7 +13,10 @@ cargo check --verbose --color always
 cargo check --release --verbose --color always
 cargo test --no-default-features
 [ "$RUSTC_MINOR_VERSION" -gt 81 ] && cargo test --features http
-cargo test --features std
+# One std test syncs much of the lightning network graph, so --release is a must
+# At least until https://github.com/lightningdevkit/rust-lightning/pull/3687 gets backported
+export RUSTFLAGS="-C debug-assertions=on"
+cargo test --features std --release
 [ "$RUSTC_MINOR_VERSION" -gt 81 ] && cargo doc --document-private-items --no-default-features
 [ "$RUSTC_MINOR_VERSION" -gt 81 ] && cargo doc --document-private-items --features http,std
 exit 0
