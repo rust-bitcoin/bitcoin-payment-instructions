@@ -347,13 +347,19 @@ mod tests {
 		let peer_manager =
 			Arc::new(PeerManager::new(handlers, 0, &rand, &TestLogger, Arc::clone(&signer)));
 
-		// Connect to a static LDK node which we know will do DNS resolutions for us.
+		// Maintain a connection to a static LDK node which we know will do DNS resolutions for us.
 		let their_id_hex = "03db10aa09ff04d3568b0621750794063df401e6853c79a21a83e1a3f3b5bfb0c8";
 		let their_id = PublicKey::from_slice(&Vec::<u8>::from_hex(their_id_hex).unwrap()).unwrap();
 		let addr = "ldk-ln-node.bitcoin.ninja:9735".to_socket_addrs().unwrap().next().unwrap();
-		let _ = lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), their_id, addr)
-			.await
-			.unwrap();
+		let connect_pm = Arc::clone(&peer_manager);
+		tokio::spawn(async move {
+			loop {
+				lightning_net_tokio::connect_outbound(Arc::clone(&connect_pm), their_id, addr)
+					.await
+					.unwrap()
+					.await;
+			}
+		});
 
 		let pm_reference = Arc::clone(&peer_manager);
 		tokio::spawn(async move {
