@@ -107,6 +107,20 @@ impl Amount {
 	pub fn btc_decimal_rounding_up_to_sats(self) -> FormattedAmount {
 		FormattedAmount(self)
 	}
+
+	/// Returns the maximum of two amounts.
+	#[inline]
+	#[must_use]
+	pub fn max(&self, other: &Amount) -> Amount {
+		Amount(self.0.max(other.0))
+	}
+
+	/// Returns the minimum of two amounts.
+	#[inline]
+	#[must_use]
+	pub fn min(&self, other: &Amount) -> Amount {
+		Amount(self.0.min(other.0))
+	}
 }
 
 #[derive(Clone, Copy)]
