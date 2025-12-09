@@ -95,6 +95,8 @@ jobs:
       - name: Sanity check fuzz targets on Rust ${{ env.TOOLCHAIN }}
         run: |
           cd fuzz
+          cargo update -p syn --precise "2.0.106" --verbose
+          cargo update -p quote --precise "1.0.41" --verbose
           RUSTFLAGS="--cfg=fuzzing --cfg=secp256k1_fuzz --cfg=hashes_fuzz" cargo test --verbose --color always
           cargo clean
       - name: Run fuzzers
