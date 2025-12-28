@@ -10,6 +10,17 @@ RUSTC_MINOR_VERSION=$(rustc --version | awk '{ split($2,a,"."); print a[2] }')
 [ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p syn --precise "2.0.106" --verbose
 # quote 1.0.42 requires rustc 1.68.0
 [ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p quote --precise "1.0.41" --verbose
+# Starting with version 1.0.104, the `proc-macro2` crate has an MSRV of rustc 1.68
+[ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p proc-macro2 --precise "1.0.103" --verbose
+
+# Starting with version 2.0.107, the `syn` crate has an MSRV of rustc 1.68
+[ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p syn --precise "2.0.106" --verbose
+
+# Starting with version 1.0.42, the `quote` crate has an MSRV of rustc 1.68
+[ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p quote --precise "1.0.41" --verbose
+
+# Starting with version 1.0.104, the `proc-macro2` crate has an MSRV of rustc 1.68
+[ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p proc-macro2 --precise "1.0.103" --verbose
 
 export RUST_BACKTRACE=1
 
