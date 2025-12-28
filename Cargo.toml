@@ -14,7 +14,8 @@ features = ["std", "http"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-http = ["reqwest", "std", "serde", "serde_json"]
+http = ["bitreq", "std", "serde", "serde_json"]
+http_proxied = [ "http", "bitreq/proxy" ]
 std = ["dnssec-prover", "getrandom"]
 default = ["std"]
 
@@ -24,7 +25,7 @@ lightning = { version = "0.2.0", default-features = false, features = ["dnssec"]
 bitcoin = { version = "0.32", default-features = false }
 getrandom = { version = "0.3", default-features = false, optional = true }
 dnssec-prover = { version = "0.6", default-features = false, optional = true, features = ["validation", "std", "tokio"] }
-reqwest = { version = "0.11", default-features = false, optional = true, features = ["rustls-tls-webpki-roots", "json"] }
+bitreq = { version = "0.2", default-features = false, optional = true, features = [ "async-https" ] }
 serde = { version = "1.0", default-features = false, optional = true, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, optional = true, features = ["alloc"] }
 

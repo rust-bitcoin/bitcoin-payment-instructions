@@ -1,4 +1,4 @@
-//! A [`HrnResolver`] which uses `reqwest` and `dns.google` (8.8.8.8) to resolve Human Readable
+//! A [`HrnResolver`] which uses `bitreq` and `dns.google` (8.8.8.8) to resolve Human Readable
 //! Names into bitcoin payment instructions.
 
 use std::boxed::Box;
@@ -23,31 +23,36 @@ use crate::hrn_resolution::{
 
 const DOH_ENDPOINT: &'static str = "https://dns.google/dns-query?dns=";
 
-/// An [`HrnResolver`] which uses `reqwest` and `dns.google` (8.8.8.8) to resolve Human Readable
+/// An [`HrnResolver`] which uses `bitreq` and `dns.google` (8.8.8.8) to resolve Human Readable
 /// Names into bitcoin payment instructions.
 ///
 /// Note that using this may reveal our IP address to the recipient and information about who we're
 /// paying to Google (via `dns.google`).
 #[derive(Debug, Clone)]
 pub struct HTTPHrnResolver {
-	client: reqwest::Client,
+	#[cfg(feature = "http_proxied")]
+	proxy: Option<bitreq::Proxy>,
 }
 
 impl HTTPHrnResolver {
-	/// Create a new `HTTPHrnResolver` with a default `reqwest::Client`.
+	/// Create a new `HTTPHrnResolver`
 	pub fn new() -> Self {
-		HTTPHrnResolver::default()
+		HTTPHrnResolver {
+			#[cfg(feature = "http_proxied")]
+			proxy: None,
+		}
 	}
 
-	/// Create a new `HTTPHrnResolver` with a custom `reqwest::Client`.
-	pub fn with_client(client: reqwest::Client) -> Self {
-		HTTPHrnResolver { client }
+	/// Create a new `HTTPHrnResolver` which makes all requests via the given proxy.
+	#[cfg(feature = "http_proxied")]
+	pub fn new_proxied(proxy: bitreq::Proxy) -> Self {
+		HTTPHrnResolver { proxy: Some(proxy) }
 	}
 }
 
 impl Default for HTTPHrnResolver {
 	fn default() -> Self {
-		HTTPHrnResolver { client: reqwest::Client::new() }
+		HTTPHrnResolver::new()
 	}
 }
 
@@ -120,6 +125,19 @@ struct LNURLCallbackResponse {
 const DNS_ERR: &'static str = "DNS Request to dns.google failed";
 
 impl HTTPHrnResolver {
+	async fn http_get(&self, url: &str, accept_dns_message: bool) -> Result<Vec<u8>, ()> {
+		let mut req = bitreq::get(url);
+		if accept_dns_message {
+			req = req.with_header("accept", "application/dns-message");
+		}
+		#[cfg(feature = "http_proxied")]
+		if let Some(proxy) = &self.proxy {
+			req = req.with_proxy(proxy.clone())
+		}
+		let resp = req.send_async().await.map_err(|_| ())?;
+		Ok(resp.into_bytes())
+	}
+
 	async fn resolve_dns(&self, hrn: &HumanReadableName) -> Result<HrnResolution, &'static str> {
 		let dns_name =
 			Name::try_from(format!("{}.user._bitcoin-payment.{}.", hrn.user(), hrn.domain()))
@@ -129,10 +147,7 @@ impl HTTPHrnResolver {
 
 		while let Some(query) = pending_queries.pop() {
 			let request_url = query_to_url(query);
-			let req =
-				self.client.get(request_url).header("accept", "application/dns-message").build();
-			let resp = self.client.execute(req.map_err(|_| DNS_ERR)?).await.map_err(|_| DNS_ERR)?;
-			let body = resp.bytes().await.map_err(|_| DNS_ERR)?;
+			let body = self.http_get(&request_url, true).await.map_err(|_| DNS_ERR)?;
 
 			let mut answer = QueryBuf::new_zeroed(0);
 			answer.extend_from_slice(&body[..]);
@@ -156,8 +171,9 @@ impl HTTPHrnResolver {
 
 	async fn resolve_lnurl_impl(&self, lnurl_url: &str) -> Result<HrnResolution, &'static str> {
 		let err = "Failed to fetch LN-Address initial well-known endpoint";
-		let init_result = self.client.get(lnurl_url).send().await.map_err(|_| err)?;
-		let init: LNURLInitResponse = init_result.json().await.map_err(|_| err)?;
+		let resp = self.http_get(lnurl_url, false).await.map_err(|_| err)?;
+		let resp_json = String::from_utf8(resp).map_err(|_| err)?;
+		let init: LNURLInitResponse = serde_json::from_str(&resp_json).map_err(|_| err)?;
 
 		if init.tag != "payRequest" {
 			return Err("LNURL initial init_response had an incorrect tag value");
@@ -218,8 +234,10 @@ impl HrnResolver for HTTPHrnResolver {
 			} else {
 				write!(&mut callback, "?amount={}", amt.milli_sats()).expect("Write to String");
 			}
-			let http_response = self.client.get(callback).send().await.map_err(|_| err)?;
-			let response: LNURLCallbackResponse = http_response.json().await.map_err(|_| err)?;
+			let resp = self.http_get(&callback, false).await.map_err(|_| err)?;
+			let resp_json = String::from_utf8(resp).map_err(|_| err)?;
+			let response: LNURLCallbackResponse =
+				serde_json::from_str(&resp_json).map_err(|_| err)?;
 
 			if !response.routes.is_empty() {
 				return Err("LNURL callback response contained a non-empty routes array");
