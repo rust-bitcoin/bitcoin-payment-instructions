@@ -99,6 +99,7 @@ mod tests {
 				},
 				PaymentMethod::LightningBolt12(_) => {},
 				PaymentMethod::OnChain { .. } => {},
+				PaymentMethod::SilentPayment { .. } => {},
 			}
 		}
 	}

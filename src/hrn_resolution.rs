@@ -19,6 +19,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[derive(Debug)]
 /// The first-step resolution of a Human Readable Name.
 ///
 /// It can either represent a resolution using BIP 353 and the DNS or the first step resolution of

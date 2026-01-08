@@ -42,11 +42,13 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use bitcoin::{address, Address, Network};
+pub use bitcoin::Network;
+use bitcoin::{address, Address};
 use core::time::Duration;
 use lightning::offers::offer::{self, Offer};
 use lightning::offers::parse::Bolt12ParseError;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef, ParseOrSemanticError};
+use silentpayments::SilentPaymentAddress;
 
 #[cfg(feature = "std")]
 mod dnssec_utils;
@@ -78,6 +80,8 @@ pub enum PaymentMethod {
 	LightningBolt12(Offer),
 	/// A payment directly on-chain to the specified address.
 	OnChain(Address),
+	/// A payment to a BIP352 payment code
+	SilentPayment(SilentPaymentAddress)
 }
 
 impl PaymentMethod {
@@ -100,6 +104,7 @@ impl PaymentMethod {
 				None => None,
 			},
 			PaymentMethod::OnChain(_) => None,
+			PaymentMethod::SilentPayment(_) => None,
 		}
 	}
 
@@ -108,6 +113,7 @@ impl PaymentMethod {
 			PaymentMethod::LightningBolt11(_) => true,
 			PaymentMethod::LightningBolt12(_) => true,
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::SilentPayment(_) => false,
 		}
 	}
 
@@ -120,10 +126,12 @@ impl PaymentMethod {
 				None => false,
 			},
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::SilentPayment(_) => false,
 		}
 	}
 }
 
+#[derive(Debug)]
 /// A payment method which may require further resolution once the amount we wish to pay is fixed.
 pub enum PossiblyResolvedPaymentMethod<'a> {
 	/// A payment using lightning as described by a BOLT 11 invoice which will be provided by this
@@ -156,6 +164,9 @@ pub enum PaymentMethodType {
 	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
 	/// [`PaymentMethod::OnChain`].
 	OnChain,
+	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
+	/// [`PaymentMethod::SilentPayment`].
+	SilentPayment,
 }
 
 impl<'a> PossiblyResolvedPaymentMethod<'a> {
@@ -166,6 +177,7 @@ impl<'a> PossiblyResolvedPaymentMethod<'a> {
 			Self::Resolved(PaymentMethod::LightningBolt11(_)) => PaymentMethodType::LightningBolt11,
 			Self::Resolved(PaymentMethod::LightningBolt12(_)) => PaymentMethodType::LightningBolt12,
 			Self::Resolved(PaymentMethod::OnChain(_)) => PaymentMethodType::OnChain,
+			Self::Resolved(PaymentMethod::SilentPayment(_)) => PaymentMethodType::SilentPayment,
 		}
 	}
 }
@@ -355,7 +367,7 @@ impl ConfigurableAmountPaymentInstructions {
 			inner.methods = vec![PaymentMethod::LightningBolt11(bolt11)];
 			inner.ln_amt = Some(amount);
 		} else {
-			if inner.methods.iter().any(|meth| matches!(meth, PaymentMethod::OnChain(_))) {
+			if inner.methods.iter().any(|meth| matches!(meth, PaymentMethod::OnChain(_) | PaymentMethod::SilentPayment(_))) {
 				let amt = Amount::from_milli_sats((amount.milli_sats() + 999) / 1000)
 					.map_err(|_| "Requested amount was too close to 21M sats to round up")?;
 				inner.onchain_amt = Some(amt);
@@ -585,34 +597,101 @@ fn parse_resolved_instructions(
 			for param in params.split('&') {
 				let (k, v) = split_once(param, '=');
 
-				let mut parse_segwit = |pfx| {
-					if let Some(address_string) = v {
-						if address_string.is_char_boundary(3)
-							&& !address_string[..3].eq_ignore_ascii_case(pfx)
-						{
-							// `bc`/`tb` key-values must only include bech32/bech32m strings with
-							// HRP "bc"/"tb" (i.e. mainnet/testnet Segwit addresses).
-							let err = "BIP 321 bitcoin: URI contained a bc/tb instruction which was not a Segwit address (bc1*/tb1*)";
+				match k {
+					k if k.eq_ignore_ascii_case("bc") || k.eq_ignore_ascii_case("req-bc") => {
+						if let Some(address_string) = v {
+							if address_string.is_char_boundary(3)
+								&& !address_string[..3].eq_ignore_ascii_case("bc1")
+							{
+								let err = "BIP 321 bitcoin: URI contained a bc instruction which was not a Segwit address (bc1*)";
+								return Err(ParseError::InvalidInstructions(err));
+							}
+							let addr = Address::from_str(address_string)
+								.map_err(ParseError::InvalidOnChain)?;
+							let address =
+								addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
+							methods.push(PaymentMethod::OnChain(address));
+						} else {
+							let err = "BIP 321 bitcoin: URI contained a bc (Segwit address) instruction without a value";
 							return Err(ParseError::InvalidInstructions(err));
 						}
-						let addr = Address::from_str(address_string)
-							.map_err(ParseError::InvalidOnChain)?;
-						let address =
-							addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
-						methods.push(PaymentMethod::OnChain(address));
-					} else {
-						let err = "BIP 321 bitcoin: URI contained a bc (Segwit address) instruction without a value";
-						return Err(ParseError::InvalidInstructions(err));
 					}
-					Ok(())
-				};
-				if k.eq_ignore_ascii_case("bc") || k.eq_ignore_ascii_case("req-bc") {
-					parse_segwit("bc1")?;
-				} else if k.eq_ignore_ascii_case("tb") || k.eq_ignore_ascii_case("req-tb") {
-					parse_segwit("tb1")?;
-				} else if k.eq_ignore_ascii_case("lightning")
-					|| k.eq_ignore_ascii_case("req-lightning")
-				{
+					k if k.eq_ignore_ascii_case("tb") || k.eq_ignore_ascii_case("req-tb") => {
+						if let Some(address_string) = v {
+							if address_string.is_char_boundary(3)
+								&& !address_string[..3].eq_ignore_ascii_case("tb1")
+							{
+								let err = "BIP 321 bitcoin: URI contained a tb instruction which was not a Segwit address (tb1*)";
+								return Err(ParseError::InvalidInstructions(err));
+							}
+							let addr = Address::from_str(address_string)
+								.map_err(ParseError::InvalidOnChain)?;
+							let address =
+								addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
+							methods.push(PaymentMethod::OnChain(address));
+						} else {
+							let err = "BIP 321 bitcoin: URI contained a tb (Segwit address) instruction without a value";
+							return Err(ParseError::InvalidInstructions(err));
+						}
+					}
+					k if k.eq_ignore_ascii_case("sp") => {
+						if let Some(address_string) = v {
+							if address_string.is_char_boundary(3)
+								&& !address_string[..3].eq_ignore_ascii_case("sp1")
+							{
+								let err = "BIP 321 bitcoin: URI contained a sp instruction which was not a Silent Payment address (sp1*)";
+								return Err(ParseError::InvalidInstructions(err));
+							}
+							let addr = SilentPaymentAddress::try_from(address_string)
+								.map_err(|_| ParseError::UnknownPaymentInstructions)?;
+							match addr.get_network() {
+								silentpayments::Network::Mainnet => {
+									if network != Network::Bitcoin {
+										return Err(ParseError::WrongNetwork);
+									}
+								}
+								_ => {
+									if network == Network::Bitcoin {
+										return Err(ParseError::WrongNetwork);
+									}
+								}
+							}
+							methods.push(PaymentMethod::SilentPayment(addr));
+						} else {
+							let err = "BIP 321 bitcoin: URI contained a sp (Silent Payment address) instruction without a value";
+							return Err(ParseError::InvalidInstructions(err));
+						}
+					}
+					k if k.eq_ignore_ascii_case("tsp") => {
+						if let Some(address_string) = v {
+							if address_string.is_char_boundary(4)
+								&& !address_string[..4].eq_ignore_ascii_case("tsp1")
+							{
+								let err = "BIP 321 bitcoin: URI contained a tsp instruction which was not a Silent Payment address (tsp1*)";
+								return Err(ParseError::InvalidInstructions(err));
+							}
+							let addr = SilentPaymentAddress::try_from(address_string)
+								.map_err(|_| ParseError::UnknownPaymentInstructions)?;
+							match addr.get_network() {
+								silentpayments::Network::Testnet => {
+									if network == Network::Bitcoin {
+										return Err(ParseError::WrongNetwork);
+									}
+								}
+								_ => {
+									if network != Network::Bitcoin {
+										return Err(ParseError::WrongNetwork);
+									}
+								}
+							}
+							methods.push(PaymentMethod::SilentPayment(addr));
+						} else {
+							let err = "BIP 321 bitcoin: URI contained a tsp (Silent Payment address) instruction without a value";
+							return Err(ParseError::InvalidInstructions(err));
+						}
+					}
+					k if k.eq_ignore_ascii_case("lightning")
+						|| k.eq_ignore_ascii_case("req-lightning") => {
 					if let Some(invoice_string) = v {
 						let invoice = Bolt11Invoice::from_str(invoice_string)
 							.map_err(ParseError::InvalidBolt11)?;
@@ -635,27 +714,31 @@ fn parse_resolved_instructions(
 						let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("lno") || k.eq_ignore_ascii_case("req-lno") {
-					if let Some(offer_string) = v {
-						let offer =
-							Offer::from_str(offer_string).map_err(ParseError::InvalidBolt12)?;
-						let (desc, method) = check_offer(offer, network)?;
-						if let Some(desc) = desc {
-							description = Some(desc);
-						}
-						methods.push(method);
-					} else {
-						let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
-						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("amount") || k.eq_ignore_ascii_case("req-amount") {
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("label") || k.eq_ignore_ascii_case("req-label") {
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("message") || k.eq_ignore_ascii_case("req-message")
-				{
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("pop") || k.eq_ignore_ascii_case("req-pop") {
+					k if k.eq_ignore_ascii_case("lno") || k.eq_ignore_ascii_case("req-lno") => {
+						if let Some(offer_string) = v {
+							let offer =
+								Offer::from_str(offer_string).map_err(ParseError::InvalidBolt12)?;
+							let (desc, method) = check_offer(offer, network)?;
+							if let Some(desc) = desc {
+								description = Some(desc);
+							}
+							methods.push(method);
+						} else {
+							let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
+							return Err(ParseError::InvalidInstructions(err));
+						}
+					}
+					k if k.eq_ignore_ascii_case("amount") || k.eq_ignore_ascii_case("req-amount") => {
+						// We handle this in the second loop below
+					}
+					k if k.eq_ignore_ascii_case("label") || k.eq_ignore_ascii_case("req-label") => {
+						// We handle this in the second loop below
+					}
+					k if k.eq_ignore_ascii_case("message") || k.eq_ignore_ascii_case("req-message") => {
+						// We handle this in the second loop below
+					}
+					k if k.eq_ignore_ascii_case("pop") || k.eq_ignore_ascii_case("req-pop") => {
 					if k.eq_ignore_ascii_case("req-pop") && !supports_proof_of_payment_callbacks {
 						return Err(ParseError::UnknownRequiredParameter);
 					}
@@ -687,8 +770,13 @@ fn parse_resolved_instructions(
 						let err = "Missing value for a Proof of Payment instruction in a BIP 321 bitcoin: URI";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.is_char_boundary(4) && k[..4].eq_ignore_ascii_case("req-") {
-					return Err(ParseError::UnknownRequiredParameter);
+					}
+					k if k.is_char_boundary(4) && k[..4].eq_ignore_ascii_case("req-") => {
+						return Err(ParseError::UnknownRequiredParameter);
+					}
+					_ => {
+						// Unknown parameter, ignore
+					}
 				}
 			}
 			let mut label = None;
@@ -753,6 +841,7 @@ fn parse_resolved_instructions(
 						method.amount()
 					},
 					PaymentMethod::OnChain(_) => onchain_amt,
+					PaymentMethod::SilentPayment(_) => onchain_amt,
 				};
 				if let Some(amt) = amt {
 					if amt < min_amt {
@@ -772,6 +861,7 @@ fn parse_resolved_instructions(
 							ln_amt = Some(amt);
 						},
 						PaymentMethod::OnChain(_) => {},
+						PaymentMethod::SilentPayment(_) => {},
 					}
 				} else if method.has_fixed_amount() {
 					have_non_btc_denominated_method = true;
@@ -1374,5 +1464,135 @@ mod tests {
 		test_lnurl(SAMPLE_LNURL_FALLBACK_WITH_AND).await;
 		test_lnurl(SAMPLE_LNURL_FALLBACK_WITH_HASHTAG).await;
 		test_lnurl(SAMPLE_LNURL_FALLBACK_WITH_BOTH).await;
+	}
+
+	#[test]
+	fn test_sp_only() {
+		let test_uri = "bitcoin:?sp=sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g";
+		
+		let result = parse_resolved_instructions(
+			test_uri,
+			Network::Bitcoin,
+			false,
+			None,
+			None,
+		);
+		
+		match result {
+			Ok(instructions) => {
+				match instructions {
+					PaymentInstructions::ConfigurableAmount(parsed) => {
+						let methods: Vec<_> = parsed.methods().collect();
+						println!("Number of methods: {}", methods.len());
+						for (i, method) in methods.iter().enumerate() {
+							match method {
+								PossiblyResolvedPaymentMethod::Resolved(pm) => {
+									println!("Method {}: Resolved({:?})", i, pm);
+								}
+								PossiblyResolvedPaymentMethod::LNURLPay { min_value, max_value, callback } => {
+									println!("Method {}: LNURLPay(min={:?}, max={:?}, callback={})", i, min_value, max_value, callback);
+								}
+							}
+						}
+						// Should have sp method
+						assert_eq!(methods.len(), 1);
+						assert!(methods.iter().any(|m| matches!(m, PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::SilentPayment(_)))));
+					}
+					_ => panic!("Expected ConfigurableAmount"),
+				}
+			}
+			Err(e) => {
+				println!("Parse error: {:?}", e);
+				panic!("Failed to parse URI with sp");
+			}
+		}
+	}
+
+	#[test]
+	fn test_sp_and_lno_together() {
+		// Using a valid BOLT 12 offer from the existing tests
+		let test_uri = "bitcoin:?sp=sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g&lno=lno1pgqppmsrse80qf0aara4slvcjxrvu6j2rp5ftmjy4yntlsmsutpkvkt6878s97hdekkkj98a73e8mafdql48yza6mnsu6dndghcq4mjts4uk8aazqgpvl7unarr59476vagwanvzkzm0lsjeccv5dgznp3dfexv6h2zytngqx0tmm7kn25f0haz9xpg300jvda8gs44662e3mncdlfc8rdnqtp0yjn436jgty63m6g3wnpd36ldchyg3yjss9dkge5efvp46gpa989elzu4h9l00ujlj24f0lc4nwq49z9c3m764qqey0j8g70cvtv7uk3zuuzswzkxxuqtmruj40kweamjy09rjetpd9xn4smnw8cv9ta5h6fltwr4x9056da3q";
+		
+		let result = parse_resolved_instructions(
+			test_uri,
+			Network::Bitcoin,
+			false,
+			None,
+			None,
+		);
+		
+		match result {
+			Ok(instructions) => {
+				match instructions {
+					PaymentInstructions::ConfigurableAmount(parsed) => {
+						let methods: Vec<_> = parsed.methods().collect();
+						println!("Number of methods: {}", methods.len());
+						for (i, method) in methods.iter().enumerate() {
+							match method {
+								PossiblyResolvedPaymentMethod::Resolved(pm) => {
+									println!("Method {}: Resolved({:?})", i, pm);
+								}
+								PossiblyResolvedPaymentMethod::LNURLPay { min_value, max_value, callback } => {
+									println!("Method {}: LNURLPay(min={:?}, max={:?}, callback={})", i, min_value, max_value, callback);
+								}
+							}
+						}
+						// Should have both sp and lno methods
+						assert_eq!(methods.len(), 2);
+						assert!(methods.iter().any(|m| matches!(m, PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::SilentPayment(_)))));
+						assert!(methods.iter().any(|m| matches!(m, PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::LightningBolt12(_)))));
+						println!("{:#?}", methods);
+					}
+					_ => panic!("Expected ConfigurableAmount"),
+				}
+			}
+			Err(e) => {
+				println!("Parse error: {:?}", e);
+				panic!("Failed to parse URI with both sp and lno");
+			}
+		}
+	}
+
+	#[test]
+	fn test_lno_only() {
+		// Using a valid BOLT 12 offer from the existing tests
+		let test_uri = "bitcoin:?lno=lno1pgqppmsrse80qf0aara4slvcjxrvu6j2rp5ftmjy4yntlsmsutpkvkt6878s97hdekkkj98a73e8mafdql48yza6mnsu6dndghcq4mjts4uk8aazqgpvl7unarr59476vagwanvzkzm0lsjeccv5dgznp3dfexv6h2zytngqx0tmm7kn25f0haz9xpg300jvda8gs44662e3mncdlfc8rdnqtp0yjn436jgty63m6g3wnpd36ldchyg3yjss9dkge5efvp46gpa989elzu4h9l00ujlj24f0lc4nwq49z9c3m764qqey0j8g70cvtv7uk3zuuzswzkxxuqtmruj40kweamjy09rjetpd9xn4smnw8cv9ta5h6fltwr4x9056da3q";
+		
+		let result = parse_resolved_instructions(
+			test_uri,
+			Network::Bitcoin,
+			false,
+			None,
+			None,
+		);
+		
+		match result {
+			Ok(instructions) => {
+				match instructions {
+					PaymentInstructions::ConfigurableAmount(parsed) => {
+						let methods: Vec<_> = parsed.methods().collect();
+						println!("Number of methods: {}", methods.len());
+						for (i, method) in methods.iter().enumerate() {
+							match method {
+								PossiblyResolvedPaymentMethod::Resolved(pm) => {
+									println!("Method {}: Resolved({:?})", i, pm);
+								}
+								PossiblyResolvedPaymentMethod::LNURLPay { min_value, max_value, callback } => {
+									println!("Method {}: LNURLPay(min={:?}, max={:?}, callback={})", i, min_value, max_value, callback);
+								}
+							}
+						}
+						// Should have both sp and lno methods
+						assert_eq!(methods.len(), 1);
+						assert!(methods.iter().any(|m| matches!(m, PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::LightningBolt12(_)))));
+					}
+					_ => panic!("Expected ConfigurableAmount"),
+				}
+			}
+			Err(e) => {
+				println!("Parse error: {:?}", e);
+				panic!("Failed to parse URI with both sp and lno");
+			}
+		}
 	}
 }
