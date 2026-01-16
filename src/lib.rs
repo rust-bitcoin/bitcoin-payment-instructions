@@ -64,6 +64,8 @@ pub mod amount;
 
 pub mod receive;
 
+pub mod cashu;
+
 pub mod hrn_resolution;
 
 use amount::Amount;
@@ -78,6 +80,8 @@ pub enum PaymentMethod {
 	LightningBolt12(Offer),
 	/// A payment directly on-chain to the specified address.
 	OnChain(Address),
+	/// A payment using Cashu as described by the given NUT-26 payment request.
+	Cashu(cashu::CashuPaymentRequest),
 }
 
 impl PaymentMethod {
@@ -100,6 +104,15 @@ impl PaymentMethod {
 				None => None,
 			},
 			PaymentMethod::OnChain(_) => None,
+			PaymentMethod::Cashu(req) => match req.unit {
+				Some(cashu::CurrencyUnit::Sat) => {
+					req.amount.and_then(|a| Amount::from_sats(a).ok())
+				},
+				Some(cashu::CurrencyUnit::Msat) => {
+					req.amount.and_then(|a| Amount::from_milli_sats(a).ok())
+				},
+				_ => None,
+			},
 		}
 	}
 
@@ -108,6 +121,7 @@ impl PaymentMethod {
 			PaymentMethod::LightningBolt11(_) => true,
 			PaymentMethod::LightningBolt12(_) => true,
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::Cashu(_) => false,
 		}
 	}
 
@@ -120,6 +134,7 @@ impl PaymentMethod {
 				None => false,
 			},
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::Cashu(req) => req.amount.is_some(),
 		}
 	}
 }
@@ -156,6 +171,9 @@ pub enum PaymentMethodType {
 	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
 	/// [`PaymentMethod::OnChain`].
 	OnChain,
+	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
+	/// [`PaymentMethod::Cashu`].
+	Cashu,
 }
 
 impl<'a> PossiblyResolvedPaymentMethod<'a> {
@@ -166,6 +184,7 @@ impl<'a> PossiblyResolvedPaymentMethod<'a> {
 			Self::Resolved(PaymentMethod::LightningBolt11(_)) => PaymentMethodType::LightningBolt11,
 			Self::Resolved(PaymentMethod::LightningBolt12(_)) => PaymentMethodType::LightningBolt12,
 			Self::Resolved(PaymentMethod::OnChain(_)) => PaymentMethodType::OnChain,
+			Self::Resolved(PaymentMethod::Cashu(_)) => PaymentMethodType::Cashu,
 		}
 	}
 }
@@ -175,6 +194,7 @@ struct PaymentInstructionsImpl {
 	description: Option<String>,
 	methods: Vec<PaymentMethod>,
 	ln_amt: Option<Amount>,
+	cashu_amt: Option<Amount>,
 	onchain_amt: Option<Amount>,
 	lnurl: Option<(String, [u8; 32], Amount, Amount)>,
 	pop_callback: Option<String>,
@@ -248,7 +268,10 @@ impl FixedAmountPaymentInstructions {
 	/// if a recipient wishes to be paid more for on-chain payments to offset their future fees),
 	/// but only up to [`MAX_AMOUNT_DIFFERENCE`].
 	pub fn max_amount(&self) -> Option<Amount> {
-		core::cmp::max(self.inner.ln_amt, self.inner.onchain_amt)
+		[self.inner.ln_amt, self.inner.onchain_amt, self.inner.cashu_amt]
+			.into_iter()
+			.flatten()
+			.max()
 	}
 
 	/// The amount which the payment instruction requires payment for when paid over lightning.
@@ -267,6 +290,14 @@ impl FixedAmountPaymentInstructions {
 	/// [`set_amount`]: ConfigurableAmountPaymentInstructions::set_amount
 	pub fn ln_payment_amount(&self) -> Option<Amount> {
 		self.inner.ln_amt
+	}
+
+	/// The amount which the payment instruction requires payment for when paid via Cashu.
+	///
+	/// We require that all Cashu payment methods in payment instructions require an identical
+	/// amount for payment.
+	pub fn cashu_payment_amount(&self) -> Option<Amount> {
+		self.inner.cashu_amt
 	}
 
 	/// The amount which the payment instruction requires payment for when paid on-chain.
@@ -345,6 +376,7 @@ impl ConfigurableAmountPaymentInstructions {
 			}
 			debug_assert!(inner.methods.is_empty());
 			debug_assert!(inner.onchain_amt.is_none());
+			debug_assert!(inner.cashu_amt.is_none());
 			debug_assert!(inner.pop_callback.is_none());
 			debug_assert!(inner.hrn_proof.is_none());
 			let bolt11 =
@@ -362,6 +394,9 @@ impl ConfigurableAmountPaymentInstructions {
 			}
 			if inner.methods.iter().any(|meth| meth.is_lightning()) {
 				inner.ln_amt = Some(amount);
+			}
+			if inner.methods.iter().any(|meth| matches!(meth, PaymentMethod::Cashu(_))) {
+				inner.cashu_amt = Some(amount);
 			}
 		}
 		Ok(FixedAmountPaymentInstructions { inner })
@@ -429,6 +464,8 @@ pub enum ParseError {
 	InvalidBolt12(Bolt12ParseError),
 	/// An invalid on-chain address was encountered
 	InvalidOnChain(address::ParseError),
+	/// An invalid Cashu payment request was encountered
+	InvalidCashu(cashu::Error),
 	/// An invalid lnurl was encountered
 	InvalidLnurl(&'static str),
 	/// The payment instructions encoded instructions for a network other than the one specified.
@@ -635,6 +672,18 @@ fn parse_resolved_instructions(
 						let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
+				} else if k.eq_ignore_ascii_case("creq") || k.eq_ignore_ascii_case("req-creq") {
+					if let Some(creq_string) = v {
+						let creq = cashu::CashuPaymentRequest::from_str(creq_string)
+							.map_err(ParseError::InvalidCashu)?;
+						if let Some(desc) = &creq.description {
+							description = Some(desc.clone());
+						}
+						methods.push(PaymentMethod::Cashu(creq));
+					} else {
+						let err = "BIP 321 bitcoin: URI contained a creq (Cashu) instruction without a value";
+						return Err(ParseError::InvalidInstructions(err));
+					}
 				} else if k.eq_ignore_ascii_case("lno") || k.eq_ignore_ascii_case("req-lno") {
 					if let Some(offer_string) = v {
 						let offer =
@@ -745,13 +794,14 @@ fn parse_resolved_instructions(
 			let mut min_amt = Amount::MAX;
 			let mut max_amt = Amount::ZERO;
 			let mut ln_amt = None;
+			let mut cashu_amt = None;
 			let mut have_amountless_method = false;
 			let mut have_non_btc_denominated_method = false;
 			for method in methods.iter() {
 				let amt = match method {
-					PaymentMethod::LightningBolt11(_) | PaymentMethod::LightningBolt12(_) => {
-						method.amount()
-					},
+					PaymentMethod::LightningBolt11(_)
+					| PaymentMethod::LightningBolt12(_)
+					| PaymentMethod::Cashu(_) => method.amount(),
 					PaymentMethod::OnChain(_) => onchain_amt,
 				};
 				if let Some(amt) = amt {
@@ -770,6 +820,15 @@ fn parse_resolved_instructions(
 								}
 							}
 							ln_amt = Some(amt);
+						},
+						PaymentMethod::Cashu(_) => {
+							if let Some(c_amt) = cashu_amt {
+								if c_amt != amt {
+									let err = "Had multiple different amounts in Cashu payment methods in a BIP 321 bitcoin: URI";
+									return Err(ParseError::InconsistentInstructions(err));
+								}
+							}
+							cashu_amt = Some(amt);
 						},
 						PaymentMethod::OnChain(_) => {},
 					}
@@ -798,6 +857,7 @@ fn parse_resolved_instructions(
 				methods,
 				onchain_amt,
 				ln_amt,
+				cashu_amt,
 				lnurl: None,
 				pop_callback,
 				hrn,
@@ -820,6 +880,7 @@ fn parse_resolved_instructions(
 					methods,
 					onchain_amt: None,
 					ln_amt: None,
+					cashu_amt: None,
 					lnurl: None,
 					pop_callback,
 					hrn,
@@ -841,6 +902,7 @@ fn parse_resolved_instructions(
 			methods: method_iter.collect(),
 			onchain_amt: amounts.fallbacks_amount,
 			ln_amt: amounts.ln_amount,
+			cashu_amt: None,
 			lnurl: None,
 			pop_callback: None,
 			hrn,
@@ -861,6 +923,7 @@ fn parse_resolved_instructions(
 				methods: vec![PaymentMethod::OnChain(address)],
 				onchain_amt: None,
 				ln_amt: None,
+				cashu_amt: None,
 				lnurl: None,
 				pop_callback: None,
 				hrn,
@@ -874,12 +937,49 @@ fn parse_resolved_instructions(
 			methods: method_iter.collect(),
 			onchain_amt: amounts.fallbacks_amount,
 			ln_amt: amounts.ln_amount,
+			cashu_amt: None,
 			lnurl: None,
 			pop_callback: None,
 			hrn,
 			hrn_proof,
 		};
 		if amounts.ln_amount.is_some() {
+			Ok(PaymentInstructions::FixedAmount(FixedAmountPaymentInstructions { inner }))
+		} else {
+			Ok(PaymentInstructions::ConfigurableAmount(ConfigurableAmountPaymentInstructions {
+				inner,
+			}))
+		}
+	} else if let Ok(creq) = cashu::CashuPaymentRequest::from_str(instructions) {
+		let has_amt = creq.amount.is_some()
+			&& (creq.unit == Some(cashu::CurrencyUnit::Sat)
+				|| creq.unit == Some(cashu::CurrencyUnit::Msat));
+		let description = creq.description.clone();
+		let cashu_amt = if has_amt {
+			match creq.unit {
+				Some(cashu::CurrencyUnit::Sat) => {
+					creq.amount.and_then(|a| Amount::from_sats(a).ok())
+				},
+				Some(cashu::CurrencyUnit::Msat) => {
+					creq.amount.and_then(|a| Amount::from_milli_sats(a).ok())
+				},
+				_ => None,
+			}
+		} else {
+			None
+		};
+		let inner = PaymentInstructionsImpl {
+			description,
+			methods: vec![PaymentMethod::Cashu(creq)],
+			onchain_amt: None,
+			ln_amt: None, // This will be filled by PaymentInstructions accessors if unit is sat/msat
+			cashu_amt,
+			lnurl: None,
+			pop_callback: None,
+			hrn,
+			hrn_proof,
+		};
+		if has_amt {
 			Ok(PaymentInstructions::FixedAmount(FixedAmountPaymentInstructions { inner }))
 		} else {
 			Ok(PaymentInstructions::ConfigurableAmount(ConfigurableAmountPaymentInstructions {
@@ -894,6 +994,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: vec![method],
 			onchain_amt: None,
+			cashu_amt: None,
 			lnurl: None,
 			pop_callback: None,
 			hrn,
@@ -940,6 +1041,7 @@ impl PaymentInstructions {
 						lnurl: Some((callback, expected_description_hash, min_value, max_value)),
 						onchain_amt: None,
 						ln_amt: None,
+						cashu_amt: None,
 						pop_callback: None,
 						hrn: Some(hrn),
 						hrn_proof: None,
@@ -990,6 +1092,7 @@ impl PaymentInstructions {
 							)),
 							onchain_amt: None,
 							ln_amt: None,
+							cashu_amt: None,
 							pop_callback: None,
 							hrn: None,
 							hrn_proof: None,
@@ -1044,6 +1147,55 @@ mod tests {
 	const SAMPLE_BIP21_WITH_INVOICE_INVOICE: &str = "lnbc10u1p3pj257pp5yztkwjcz5ftl5laxkav23zmzekaw37zk6kmv80pk4xaev5qhtz7qdpdwd3xger9wd5kwm36yprx7u3qd36kucmgyp282etnv3shjcqzpgxqyz5vqsp5usyc4lk9chsfp53kvcnvq456ganh60d89reykdngsmtj6yw3nhvq9qyyssqjcewm5cjwz4a6rfjx77c490yced6pemk0upkxhy89cmm7sct66k8gneanwykzgdrwrfje69h9u5u0w57rrcsysas7gadwmzxc8c6t0spjazup6";
 
 	const SAMPLE_BIP21_WITH_INVOICE_AND_LABEL: &str = "bitcoin:tb1p0vztr8q25czuka5u4ta5pqu0h8dxkf72mam89cpg4tg40fm8wgmqp3gv99?amount=0.000001&label=yooo&lightning=lntbs1u1pjrww6fdq809hk7mcnp4qvwggxr0fsueyrcer4x075walsv93vqvn3vlg9etesx287x6ddy4xpp5a3drwdx2fmkkgmuenpvmynnl7uf09jmgvtlg86ckkvgn99ajqgtssp5gr3aghgjxlwshnqwqn39c2cz5hw4cnsnzxdjn7kywl40rru4mjdq9qyysgqcqpcxqrpwurzjqfgtsj42x8an5zujpxvfhp9ngwm7u5lu8lvzfucjhex4pq8ysj5q2qqqqyqqv9cqqsqqqqlgqqqqqqqqfqzgl9zq04nzpxyvdr8vj3h98gvnj3luanj2cxcra0q2th4xjsxmtj8k3582l67xq9ffz5586f3nm5ax58xaqjg6rjcj2vzvx2q39v9eqpn0wx54";
+
+	#[tokio::test]
+	async fn parse_cashu() {
+		let creq = "CREQB1QYQQWER9D4HNZV3NQGQQSQQQQQQQQQQRAQPSQQGQQSQQZQG9QQVXSAR5WPEN5TE0D45KUAPWV4UXZMTSD3JJUCM0D5RQQRJRDANXVET9YPCXZ7TDV4H8GXHR3TQ";
+		let parsed = PaymentInstructions::parse(creq, Network::Bitcoin, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount for Cashu with amount"),
+		};
+
+		assert_eq!(parsed.methods().len(), 1);
+		assert_eq!(parsed.cashu_payment_amount(), Some(Amount::from_sats(1000).unwrap()));
+		// Max amount should pick up the cashu amount
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.recipient_description(), Some("Coffee payment"));
+
+		if let PaymentMethod::Cashu(req) = &parsed.methods()[0] {
+			assert_eq!(req.amount, Some(1000));
+			assert_eq!(req.unit, Some(cashu::CurrencyUnit::Sat));
+		} else {
+			panic!("Wrong method type");
+		}
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_creq() {
+		let creq = "CREQB1QYQQWER9D4HNZV3NQGQQSQQQQQQQQQQRAQPSQQGQQSQQZQG9QQVXSAR5WPEN5TE0D45KUAPWV4UXZMTSD3JJUCM0D5RQQRJRDANXVET9YPCXZ7TDV4H8GXHR3TQ";
+		let uri = format!("bitcoin:?creq={}", creq);
+
+		let parsed = PaymentInstructions::parse(&uri, Network::Bitcoin, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount"),
+		};
+
+		assert_eq!(parsed.methods().len(), 1);
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		if let PaymentMethod::Cashu(_) = &parsed.methods()[0] {
+			// ok
+		} else {
+			panic!("Wrong method");
+		}
+	}
 
 	#[tokio::test]
 	async fn parse_address() {
