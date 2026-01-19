@@ -425,7 +425,7 @@ impl CashuPaymentRequest {
 				},
 				0x07 => {
 					// transport: sub-TLV (repeatable)
-					let transport = Self::decode_transport(&value)?;
+					let transport = Self::decode_transport(value)?;
 					transports.push(transport);
 				},
 				0x08 => {
@@ -433,7 +433,7 @@ impl CashuPaymentRequest {
 					if nut10.is_some() {
 						return Err(Error::InvalidStructure);
 					}
-					nut10 = Some(Self::decode_nut10(&value)?);
+					nut10 = Some(Self::decode_nut10(value)?);
 				},
 				_ => {
 					// Unknown tags are ignored
@@ -606,7 +606,7 @@ impl CashuPaymentRequest {
 
 		let target = match transport_type {
 			TransportType::Nostr => {
-				if let Some(ref pk) = pubkey {
+				if let Some(pk) = pubkey {
 					Self::encode_nprofile(pk, &relays)?
 				} else {
 					return Err(Error::InvalidStructure);
@@ -909,7 +909,7 @@ impl CashuPaymentRequest {
 		}
 
 		let hrp = Hrp::parse("nprofile").map_err(|_| Error::InvalidPrefix)?;
-		Ok(bech32::encode::<bech32::Bech32>(hrp, &tlv_bytes).map_err(|_| Error::Bech32)?)
+		bech32::encode::<bech32::Bech32>(hrp, &tlv_bytes).map_err(|_| Error::Bech32)
 	}
 }
 
