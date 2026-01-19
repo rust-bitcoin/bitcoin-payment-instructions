@@ -63,41 +63,6 @@ pub enum CurrencyUnit {
 	Custom(String),
 }
 
-/// Unit representation for TLV encoding
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TlvUnit {
-	Sat,
-	Custom(String),
-}
-
-impl From<CurrencyUnit> for TlvUnit {
-	fn from(unit: CurrencyUnit) -> Self {
-		match unit {
-			CurrencyUnit::Sat => TlvUnit::Sat,
-			CurrencyUnit::Msat => TlvUnit::Custom("msat".to_string()),
-			CurrencyUnit::Usd => TlvUnit::Custom("usd".to_string()),
-			CurrencyUnit::Eur => TlvUnit::Custom("eur".to_string()),
-			CurrencyUnit::Custom(c) => TlvUnit::Custom(c),
-			CurrencyUnit::Auth => TlvUnit::Custom("auth".to_string()),
-		}
-	}
-}
-
-impl From<TlvUnit> for CurrencyUnit {
-	fn from(unit: TlvUnit) -> Self {
-		match unit {
-			TlvUnit::Sat => CurrencyUnit::Sat,
-			TlvUnit::Custom(s) => match s.as_str() {
-				"msat" => CurrencyUnit::Msat,
-				"usd" => CurrencyUnit::Usd,
-				"eur" => CurrencyUnit::Eur,
-				"auth" => CurrencyUnit::Auth,
-				_ => CurrencyUnit::Custom(s), // preserve unknown units
-			},
-		}
-	}
-}
-
 /// The mechanism used to deliver the ecash token
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
@@ -220,7 +185,7 @@ impl<'a> TlvReader<'a> {
 		Self { data, position: 0 }
 	}
 
-	fn read_tlv(&mut self) -> Result<Option<(u8, Vec<u8>)>, Error> {
+	fn read_tlv(&mut self) -> Result<Option<(u8, &'a [u8])>, Error> {
 		if self.position + 3 > self.data.len() {
 			return Ok(None);
 		}
@@ -234,21 +199,25 @@ impl<'a> TlvReader<'a> {
 			return Err(Error::InvalidLength);
 		}
 
-		let value = self.data[self.position..self.position + len].to_vec();
+		let value = &self.data[self.position..self.position + len];
 		self.position += len;
 
 		Ok(Some((tag, value)))
 	}
 }
 
-/// TLV writer helper for creating binary TLV data
+/// Helper to write TLV (Tag-Length-Value) data directly to a buffer.
+///
+/// For nested TLVs, use [`SingleTlvWriter`] which provides RAII-based length patching.
+/// This avoids intermediate allocations by writing directly to a single buffer and
+/// patching the length field when the wrapper is dropped.
 struct TlvWriter {
 	data: Vec<u8>,
 }
 
 impl TlvWriter {
-	fn new() -> Self {
-		Self { data: Vec::new() }
+	fn with_capacity(capacity: usize) -> Self {
+		Self { data: Vec::with_capacity(capacity) }
 	}
 
 	fn write_tlv(&mut self, tag: u8, value: &[u8]) {
@@ -258,8 +227,60 @@ impl TlvWriter {
 		self.data.extend_from_slice(value);
 	}
 
+	/// Write raw bytes directly to the buffer (used for tag tuple encoding).
+	fn write_raw(&mut self, bytes: &[u8]) {
+		self.data.extend_from_slice(bytes);
+	}
+
+	/// Write a single byte directly to the buffer.
+	fn write_byte(&mut self, byte: u8) {
+		self.data.push(byte);
+	}
+
 	fn into_bytes(self) -> Vec<u8> {
 		self.data
+	}
+}
+
+/// Wrapper for writing a single nested TLV structure.
+/// Writes the tag and length placeholder on creation, patches the length on drop.
+struct SingleTlvWriter<'a> {
+	writer: &'a mut TlvWriter,
+	len_pos: usize,
+}
+
+impl<'a> SingleTlvWriter<'a> {
+	fn new(writer: &'a mut TlvWriter, tag: u8) -> Self {
+		writer.data.push(tag);
+		let len_pos = writer.data.len();
+		writer.data.extend_from_slice(&[0, 0]); // Placeholder for length
+		Self { writer, len_pos }
+	}
+
+	/// Create a nested TLV writer within this one.
+	fn nested(&mut self, tag: u8) -> SingleTlvWriter<'_> {
+		SingleTlvWriter::new(self.writer, tag)
+	}
+
+	fn write_tlv(&mut self, tag: u8, value: &[u8]) {
+		self.writer.write_tlv(tag, value);
+	}
+
+	fn write_raw(&mut self, bytes: &[u8]) {
+		self.writer.write_raw(bytes);
+	}
+
+	fn write_byte(&mut self, byte: u8) {
+		self.writer.write_byte(byte);
+	}
+}
+
+impl Drop for SingleTlvWriter<'_> {
+	fn drop(&mut self) {
+		let value_len = self.writer.data.len() - (self.len_pos + 2);
+		let len_bytes = (value_len as u16).to_be_bytes();
+		self.writer.data[self.len_pos] = len_bytes[0];
+		self.writer.data[self.len_pos + 1] = len_bytes[1];
 	}
 }
 
@@ -342,7 +363,7 @@ impl CashuPaymentRequest {
 					if id.is_some() {
 						return Err(Error::InvalidStructure);
 					}
-					id = Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
+					id = Some(String::from_utf8(value.to_vec()).map_err(|_| Error::InvalidUtf8)?);
 				},
 				0x02 => {
 					// amount: u64
@@ -366,8 +387,17 @@ impl CashuPaymentRequest {
 					if value.len() == 1 && value[0] == 0 {
 						unit = Some(CurrencyUnit::Sat);
 					} else {
-						let unit_str = String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?;
-						unit = Some(TlvUnit::Custom(unit_str).into());
+						match value {
+							b"msat" => unit = Some(CurrencyUnit::Msat),
+							b"usd" => unit = Some(CurrencyUnit::Usd),
+							b"eur" => unit = Some(CurrencyUnit::Eur),
+							b"auth" => unit = Some(CurrencyUnit::Auth),
+							_ => {
+								let unit_str = String::from_utf8(value.to_vec())
+									.map_err(|_| Error::InvalidUtf8)?;
+								unit = Some(CurrencyUnit::Custom(unit_str));
+							},
+						}
 					}
 				},
 				0x04 => {
@@ -381,7 +411,8 @@ impl CashuPaymentRequest {
 				},
 				0x05 => {
 					// mint: string (repeatable)
-					let mint_str = String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?;
+					let mint_str =
+						String::from_utf8(value.to_vec()).map_err(|_| Error::InvalidUtf8)?;
 					mints.push(mint_str);
 				},
 				0x06 => {
@@ -389,7 +420,8 @@ impl CashuPaymentRequest {
 					if description.is_some() {
 						return Err(Error::InvalidStructure);
 					}
-					description = Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
+					description =
+						Some(String::from_utf8(value.to_vec()).map_err(|_| Error::InvalidUtf8)?);
 				},
 				0x07 => {
 					// transport: sub-TLV (repeatable)
@@ -423,7 +455,26 @@ impl CashuPaymentRequest {
 
 	/// Encode to TLV bytes
 	fn encode_tlv(&self) -> Result<Vec<u8>, Error> {
-		let mut writer = TlvWriter::new();
+		// Estimate capacity to minimize reallocations:
+		// - Each TLV header is 3 bytes (1 tag + 2 length)
+		// - id: ~10-50 bytes typical
+		// - amount: 8 bytes
+		// - unit: 1-10 bytes
+		// - single_use: 1 byte
+		// - mints: variable, ~50 bytes each
+		// - description: variable
+		// - transports: ~100-200 bytes each
+		// - nut10: ~100 bytes
+		let estimated_capacity = 64
+			+ self.payment_id.as_ref().map_or(0, |s| s.len() + 3)
+			+ self.amount.map_or(0, |_| 11)
+			+ self.unit.as_ref().map_or(0, |_| 10)
+			+ self.mints.as_ref().map_or(0, |m| m.iter().map(|s| s.len() + 3).sum())
+			+ self.description.as_ref().map_or(0, |s| s.len() + 3)
+			+ self.transports.len() * 150
+			+ self.nut10.as_ref().map_or(0, |_| 100);
+
+		let mut writer = TlvWriter::with_capacity(estimated_capacity);
 
 		// 0x01 id: string
 		if let Some(ref id) = self.payment_id {
@@ -438,10 +489,13 @@ impl CashuPaymentRequest {
 
 		// 0x03 unit: u8 or string
 		if let Some(ref unit) = self.unit {
-			let tlv_unit = TlvUnit::from(unit.clone());
-			match tlv_unit {
-				TlvUnit::Sat => writer.write_tlv(0x03, &[0]),
-				TlvUnit::Custom(s) => writer.write_tlv(0x03, s.as_bytes()),
+			match unit {
+				CurrencyUnit::Sat => writer.write_tlv(0x03, &[0]),
+				CurrencyUnit::Msat => writer.write_tlv(0x03, b"msat"),
+				CurrencyUnit::Usd => writer.write_tlv(0x03, b"usd"),
+				CurrencyUnit::Eur => writer.write_tlv(0x03, b"eur"),
+				CurrencyUnit::Auth => writer.write_tlv(0x03, b"auth"),
+				CurrencyUnit::Custom(s) => writer.write_tlv(0x03, s.as_bytes()),
 			}
 		}
 
@@ -467,14 +521,14 @@ impl CashuPaymentRequest {
 			if transport.kind == TransportType::InBand {
 				continue;
 			}
-			let transport_bytes = Self::encode_transport(transport)?;
-			writer.write_tlv(0x07, &transport_bytes);
+			let mut w = SingleTlvWriter::new(&mut writer, 0x07);
+			Self::encode_transport_into(transport, &mut w)?;
 		}
 
 		// 0x08 nut10: sub-TLV
 		if let Some(ref nut10) = self.nut10 {
-			let nut10_bytes = Self::encode_nut10(nut10)?;
-			writer.write_tlv(0x08, &nut10_bytes);
+			let mut w = SingleTlvWriter::new(&mut writer, 0x08);
+			Self::encode_nut10_into(nut10, &mut w)?;
 		}
 
 		Ok(writer.into_bytes())
@@ -485,8 +539,8 @@ impl CashuPaymentRequest {
 		let mut reader = TlvReader::new(bytes);
 
 		let mut kind: Option<u8> = None;
-		let mut pubkey: Option<Vec<u8>> = None;
-		let mut tags: Vec<(String, Vec<String>)> = Vec::new();
+		let mut pubkey: Option<&[u8]> = None;
+		let mut tags: Vec<(&str, Vec<&str>)> = Vec::new();
 		let mut http_target: Option<String> = None;
 
 		while let Some((tag, value)) = reader.read_tlv()? {
@@ -519,8 +573,10 @@ impl CashuPaymentRequest {
 							if http_target.is_some() {
 								return Err(Error::InvalidStructure);
 							}
-							http_target =
-								Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
+							http_target = Some(
+								String::from_utf8(value.to_vec())
+									.map_err(|_| Error::InvalidUtf8)?,
+							);
 						},
 						None => {
 							// kind should always be present if there's a target
@@ -530,7 +586,7 @@ impl CashuPaymentRequest {
 				},
 				0x03 => {
 					// tag_tuple: generic tuple (repeatable)
-					let tag_tuple = Self::decode_tag_tuple(&value)?;
+					let tag_tuple = Self::decode_tag_tuple(value)?;
 					tags.push(tag_tuple);
 				},
 				_ => {
@@ -545,13 +601,13 @@ impl CashuPaymentRequest {
 			_ => return Err(Error::InvalidStructure),
 		};
 
-		let relays: Vec<String> =
-			tags.iter().filter(|(k, _)| k == "r").flat_map(|(_, v)| v.clone()).collect();
+		let relays: Vec<&str> =
+			tags.iter().filter(|(k, _)| *k == "r").flat_map(|(_, v)| v.iter().copied()).collect();
 
 		let target = match transport_type {
 			TransportType::Nostr => {
-				if let Some(pk) = pubkey {
-					Self::encode_nprofile(&pk, &relays)?
+				if let Some(ref pk) = pubkey {
+					Self::encode_nprofile(pk, &relays)?
 				} else {
 					return Err(Error::InvalidStructure);
 				}
@@ -566,11 +622,11 @@ impl CashuPaymentRequest {
 		for (key, values) in tags {
 			if key == "r" {
 				for relay in values {
-					final_tags.push(vec!["relay".to_string(), relay]);
+					final_tags.push(vec!["relay".to_string(), relay.to_string()]);
 				}
 			} else {
-				let mut v = vec![key];
-				v.extend(values);
+				let mut v = vec![key.to_string()];
+				v.extend(values.into_iter().map(String::from));
 				final_tags.push(v);
 			}
 		}
@@ -582,10 +638,10 @@ impl CashuPaymentRequest {
 		})
 	}
 
-	/// Encode transport to sub-TLV
-	fn encode_transport(transport: &Transport) -> Result<Vec<u8>, Error> {
-		let mut writer = TlvWriter::new();
-
+	/// Encode transport body directly into the provided writer to avoid intermediate allocations.
+	fn encode_transport_into(
+		transport: &Transport, writer: &mut SingleTlvWriter<'_>,
+	) -> Result<(), Error> {
 		let kind = match transport.kind {
 			TransportType::InBand => {
 				return Err(Error::InvalidStructure);
@@ -609,21 +665,18 @@ impl CashuPaymentRequest {
 							continue;
 						}
 						if tag[0] == "n" && tag.len() >= 2 {
-							let tag_bytes = Self::encode_tag_tuple(tag)?;
-							writer.write_tlv(0x03, &tag_bytes);
+							Self::encode_tag_tuple_into(tag, writer)?;
 						} else if tag[0] == "relay" && tag.len() >= 2 {
 							all_relays.push(tag[1].clone());
 						} else {
-							let tag_bytes = Self::encode_tag_tuple(tag)?;
-							writer.write_tlv(0x03, &tag_bytes);
+							Self::encode_tag_tuple_into(tag, writer)?;
 						}
 					}
 				}
 
 				for relay in all_relays {
 					let relay_tag = vec!["r".to_string(), relay];
-					let tag_bytes = Self::encode_tag_tuple(&relay_tag)?;
-					writer.write_tlv(0x03, &tag_bytes);
+					Self::encode_tag_tuple_into(&relay_tag, writer)?;
 				}
 			},
 			TransportType::HttpPost => {
@@ -632,8 +685,7 @@ impl CashuPaymentRequest {
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
 						if !tag.is_empty() {
-							let tag_bytes = Self::encode_tag_tuple(tag)?;
-							writer.write_tlv(0x03, &tag_bytes);
+							Self::encode_tag_tuple_into(tag, writer)?;
 						}
 					}
 				}
@@ -643,7 +695,7 @@ impl CashuPaymentRequest {
 			},
 		}
 
-		Ok(writer.into_bytes())
+		Ok(())
 	}
 
 	/// Decode NUT-10 sub-TLV
@@ -671,13 +723,13 @@ impl CashuPaymentRequest {
 					if data.is_some() {
 						return Err(Error::InvalidStructure);
 					}
-					data = Some(value);
+					data = Some(value.to_vec());
 				},
 				0x03 | 0x05 => {
 					// tag_tuple: generic tuple (repeatable)
-					let tag_tuple = Self::decode_tag_tuple(&value)?;
-					let mut v = vec![tag_tuple.0];
-					v.extend(tag_tuple.1);
+					let tag_tuple = Self::decode_tag_tuple(value)?;
+					let mut v = vec![tag_tuple.0.to_string()];
+					v.extend(tag_tuple.1.into_iter().map(String::from));
 					tags.push(v);
 				},
 				_ => {
@@ -704,10 +756,10 @@ impl CashuPaymentRequest {
 		))
 	}
 
-	/// Encode NUT-10 to sub-TLV
-	fn encode_nut10(nut10: &Nut10SecretRequest) -> Result<Vec<u8>, Error> {
-		let mut writer = TlvWriter::new();
-
+	/// Encode NUT-10 body directly into the provided writer to avoid intermediate allocations.
+	fn encode_nut10_into(
+		nut10: &Nut10SecretRequest, writer: &mut SingleTlvWriter<'_>,
+	) -> Result<(), Error> {
 		let kind_val = match nut10.kind {
 			Kind::P2PK => 0u8,
 			Kind::HTLC => 1u8,
@@ -717,16 +769,15 @@ impl CashuPaymentRequest {
 
 		if let Some(ref tags) = nut10.tags {
 			for tag in tags {
-				let tag_bytes = Self::encode_tag_tuple(tag)?;
-				writer.write_tlv(0x03, &tag_bytes);
+				Self::encode_tag_tuple_into(tag, writer)?;
 			}
 		}
 
-		Ok(writer.into_bytes())
+		Ok(())
 	}
 
-	/// Decode tag tuple
-	fn decode_tag_tuple(bytes: &[u8]) -> Result<(String, Vec<String>), Error> {
+	/// Decode tag tuple, returning borrowed strings to avoid intermediate allocations.
+	fn decode_tag_tuple(bytes: &[u8]) -> Result<(&str, Vec<&str>), Error> {
 		if bytes.is_empty() {
 			return Err(Error::InvalidLength);
 		}
@@ -736,8 +787,7 @@ impl CashuPaymentRequest {
 			return Err(Error::InvalidLength);
 		}
 
-		let key =
-			String::from_utf8(bytes[1..1 + key_len].to_vec()).map_err(|_| Error::InvalidUtf8)?;
+		let key = core::str::from_utf8(&bytes[1..1 + key_len]).map_err(|_| Error::InvalidUtf8)?;
 
 		let mut values = Vec::new();
 		let mut pos = 1 + key_len;
@@ -750,8 +800,8 @@ impl CashuPaymentRequest {
 				return Err(Error::InvalidLength);
 			}
 
-			let value = String::from_utf8(bytes[pos..pos + val_len].to_vec())
-				.map_err(|_| Error::InvalidUtf8)?;
+			let value =
+				core::str::from_utf8(&bytes[pos..pos + val_len]).map_err(|_| Error::InvalidUtf8)?;
 			values.push(value);
 			pos += val_len;
 		}
@@ -759,26 +809,29 @@ impl CashuPaymentRequest {
 		Ok((key, values))
 	}
 
-	/// Encode tag tuple
-	fn encode_tag_tuple(tag: &[String]) -> Result<Vec<u8>, Error> {
+	/// Encode tag tuple directly into the provided writer to avoid intermediate allocations.
+	/// Writes as a 0x03 sub-TLV (tag + length + key/values).
+	fn encode_tag_tuple_into(
+		tag: &[String], writer: &mut SingleTlvWriter<'_>,
+	) -> Result<(), Error> {
 		if tag.is_empty() {
 			return Err(Error::InvalidLength);
 		}
 
-		let mut bytes = Vec::new();
+		let mut w = writer.nested(0x03);
 
 		// Key length + key
 		let key = &tag[0];
-		bytes.push(key.len() as u8);
-		bytes.extend_from_slice(key.as_bytes());
+		w.write_byte(key.len() as u8);
+		w.write_raw(key.as_bytes());
 
 		// Values
 		for value in &tag[1..] {
-			bytes.push(value.len() as u8);
-			bytes.extend_from_slice(value.as_bytes());
+			w.write_byte(value.len() as u8);
+			w.write_raw(value.as_bytes());
 		}
 
-		Ok(bytes)
+		Ok(())
 	}
 
 	/// Decode nprofile bech32 string to (pubkey, relays)
@@ -833,7 +886,7 @@ impl CashuPaymentRequest {
 	}
 
 	/// Encode pubkey and relays to nprofile bech32 string
-	fn encode_nprofile(pubkey: &[u8], relays: &[String]) -> Result<String, Error> {
+	fn encode_nprofile(pubkey: &[u8], relays: &[&str]) -> Result<String, Error> {
 		if pubkey.len() != 32 {
 			return Err(Error::InvalidLength);
 		}
@@ -1089,7 +1142,7 @@ mod tests {
 		// Create a payment request with nostr transport using nprofile
 		let pubkey_hex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
 		let pubkey_bytes = Vec::<u8>::from_hex(pubkey_hex).unwrap();
-		let relays = vec!["wss://relay.example.com".to_string()];
+		let relays: Vec<&str> = vec!["wss://relay.example.com"];
 		let nprofile =
 			CashuPaymentRequest::encode_nprofile(&pubkey_bytes, &relays).expect("encode nprofile");
 
@@ -1135,7 +1188,7 @@ mod tests {
 		// Payment request with nostr transport, NIP-17, pubkey, and one relay
 		let pubkey_hex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
 		let pubkey_bytes = Vec::<u8>::from_hex(pubkey_hex).unwrap();
-		let relays = vec!["wss://relay.damus.io".to_string()];
+		let relays: Vec<&str> = vec!["wss://relay.damus.io"];
 		let nprofile =
 			CashuPaymentRequest::encode_nprofile(&pubkey_bytes, &relays).expect("encode nprofile");
 
@@ -1190,7 +1243,7 @@ mod tests {
 
 		let pubkey2_hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 		let pubkey2_bytes = Vec::<u8>::from_hex(pubkey2_hex).unwrap();
-		let relays2 = vec!["wss://relay.damus.io".to_string(), "wss://nos.lol".to_string()];
+		let relays2: Vec<&str> = vec!["wss://relay.damus.io", "wss://nos.lol"];
 		let nprofile2 = CashuPaymentRequest::encode_nprofile(&pubkey2_bytes, &relays2)
 			.expect("encode nprofile2");
 
@@ -1839,14 +1892,14 @@ mod tests {
 	#[test]
 	fn test_duplicate_tlv_fields() {
 		// 1. Top-level: Duplicate Amount (Tag 0x02)
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(32);
 		writer.write_tlv(0x02, &100u64.to_be_bytes());
 		writer.write_tlv(0x02, &200u64.to_be_bytes());
 		let bytes = writer.into_bytes();
 		assert_eq!(CashuPaymentRequest::from_bech32_bytes(&bytes), Err(Error::InvalidStructure));
 
 		// 2. Transport: Duplicate Kind (Tag 0x01)
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(16);
 		writer.write_tlv(0x01, &[0x00]); // Nostr
 		writer.write_tlv(0x01, &[0x01]); // HTTP
 		let bytes = writer.into_bytes();
@@ -1854,7 +1907,7 @@ mod tests {
 
 		// 3. Transport: Duplicate Target (Tag 0x02) for Nostr
 		let pubkey = vec![0u8; 32];
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(128);
 		writer.write_tlv(0x01, &[0x00]); // Kind Nostr
 		writer.write_tlv(0x02, &pubkey);
 		writer.write_tlv(0x02, &pubkey);
@@ -1862,7 +1915,7 @@ mod tests {
 		assert_eq!(CashuPaymentRequest::decode_transport(&bytes), Err(Error::InvalidStructure));
 
 		// 4. Transport: Duplicate Target (Tag 0x02) for HTTP
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(64);
 		writer.write_tlv(0x01, &[0x01]); // Kind HTTP
 		writer.write_tlv(0x02, b"https://example.com");
 		writer.write_tlv(0x02, b"https://example.org");
@@ -1870,14 +1923,14 @@ mod tests {
 		assert_eq!(CashuPaymentRequest::decode_transport(&bytes), Err(Error::InvalidStructure));
 
 		// 5. NUT-10: Duplicate Kind (Tag 0x01)
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(16);
 		writer.write_tlv(0x01, &[0x00]); // Kind P2PK
 		writer.write_tlv(0x01, &[0x01]); // Kind HTLC
 		let bytes = writer.into_bytes();
 		assert_eq!(CashuPaymentRequest::decode_nut10(&bytes), Err(Error::InvalidStructure));
 
 		// 6. NUT-10: Duplicate Data (Tag 0x02)
-		let mut writer = TlvWriter::new();
+		let mut writer = TlvWriter::with_capacity(32);
 		writer.write_tlv(0x01, &[0x00]); // Kind P2PK
 		writer.write_tlv(0x02, b"data1");
 		writer.write_tlv(0x02, b"data2");
