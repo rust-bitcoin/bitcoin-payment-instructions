@@ -7,12 +7,17 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::Deref;
 use core::str::FromStr;
 
 use bitcoin::bech32::{self, Bech32m, Hrp};
 
 /// Human-readable part for CREQ-B bech32m encoding
 pub const CREQ_B_HRP: &str = "creqb";
+
+/// Maximum number of bytes that can be stored inline in a `UnitString`.
+/// Set to 11 so that `UnitString` fits in 12 bytes (matching `String` on 32-bit systems).
+const INLINE_UNIT_BYTES: usize = 11;
 
 /// Errors that can occur during parsing and encoding of Cashu payment requests
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +34,104 @@ pub enum Error {
 	Bech32,
 	/// Invalid TLV structure (missing required fields, unexpected values, malformed TLV)
 	InvalidStructure,
+}
+
+/// A string type optimized for short currency unit names.
+///
+/// Stores strings of 11 bytes or less inline without heap allocation.
+/// Longer strings fall back to heap allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitString(UnitStringInner);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnitStringInner {
+	Inline { bytes: [u8; INLINE_UNIT_BYTES], len: u8 },
+	Heap(String),
+}
+
+impl UnitString {
+	/// Creates a new `UnitString` from a string slice.
+	pub fn new(s: &str) -> Self {
+		let bytes = s.as_bytes();
+		if bytes.len() <= INLINE_UNIT_BYTES {
+			let mut arr = [0u8; INLINE_UNIT_BYTES];
+			arr[..bytes.len()].copy_from_slice(bytes);
+			Self(UnitStringInner::Inline { bytes: arr, len: bytes.len() as u8 })
+		} else {
+			Self(UnitStringInner::Heap(s.to_string()))
+		}
+	}
+
+	/// Creates a `UnitString` from a byte slice, returning `None` if the bytes are not valid UTF-8.
+	pub fn from_utf8(bytes: &[u8]) -> Option<Self> {
+		core::str::from_utf8(bytes).ok().map(Self::new)
+	}
+
+	/// Returns the string as a string slice.
+	pub fn as_str(&self) -> &str {
+		match &self.0 {
+			UnitStringInner::Inline { bytes, len } => {
+				// We only store valid UTF-8 in the inline buffer via the
+				// public constructors, and UnitStringInner is private.
+				core::str::from_utf8(&bytes[..*len as usize])
+					.expect("UnitString contains valid UTF-8")
+			},
+			UnitStringInner::Heap(s) => s.as_str(),
+		}
+	}
+
+	/// Returns the string as a byte slice.
+	pub fn as_bytes(&self) -> &[u8] {
+		self.as_str().as_bytes()
+	}
+}
+
+impl Deref for UnitString {
+	type Target = str;
+
+	fn deref(&self) -> &Self::Target {
+		self.as_str()
+	}
+}
+
+impl AsRef<str> for UnitString {
+	fn as_ref(&self) -> &str {
+		self.as_str()
+	}
+}
+
+impl fmt::Display for UnitString {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(self.as_str(), f)
+	}
+}
+
+impl PartialEq<str> for UnitString {
+	fn eq(&self, other: &str) -> bool {
+		self.as_str() == other
+	}
+}
+
+impl PartialEq<&str> for UnitString {
+	fn eq(&self, other: &&str) -> bool {
+		self.as_str() == *other
+	}
+}
+
+impl From<&str> for UnitString {
+	fn from(s: &str) -> Self {
+		Self::new(s)
+	}
+}
+
+impl From<String> for UnitString {
+	fn from(s: String) -> Self {
+		if s.len() <= INLINE_UNIT_BYTES {
+			Self::new(&s)
+		} else {
+			Self(UnitStringInner::Heap(s))
+		}
+	}
 }
 
 /// Supported Currency Units
@@ -60,7 +163,14 @@ pub enum CurrencyUnit {
 	Auth,
 	/// Custom unit (e.g., other ISO 4217 codes like `gbp`, `jpy`).
 	/// Note: There is no length limit for the unit string according to the spec.
-	Custom(String),
+	Custom(UnitString),
+}
+
+impl CurrencyUnit {
+	/// Creates a custom currency unit from a string slice.
+	pub fn custom(s: &str) -> Self {
+		Self::Custom(UnitString::new(s))
+	}
 }
 
 /// The mechanism used to deliver the ecash token
@@ -393,8 +503,8 @@ impl CashuPaymentRequest {
 							b"eur" => unit = Some(CurrencyUnit::Eur),
 							b"auth" => unit = Some(CurrencyUnit::Auth),
 							_ => {
-								let unit_str = String::from_utf8(value.to_vec())
-									.map_err(|_| Error::InvalidUtf8)?;
+								let unit_str =
+									UnitString::from_utf8(value).ok_or(Error::InvalidUtf8)?;
 								unit = Some(CurrencyUnit::Custom(unit_str));
 							},
 						}
@@ -1869,7 +1979,7 @@ mod tests {
 		let payment_request = CashuPaymentRequest {
 			payment_id: Some("custom_unit".to_string()),
 			amount: Some(100),
-			unit: Some(CurrencyUnit::Custom("btc".to_string())),
+			unit: Some(CurrencyUnit::custom("btc")),
 			single_use: None,
 			mints: Some(vec!["https://mint.example.com".to_string()]),
 			description: None,
@@ -1885,8 +1995,32 @@ mod tests {
 		let decoded =
 			CashuPaymentRequest::from_bech32_string(&encoded).expect("decoding should work");
 
-		assert_eq!(decoded.unit, Some(CurrencyUnit::Custom("btc".to_string())));
+		assert_eq!(decoded.unit, Some(CurrencyUnit::custom("btc")));
 		assert_eq!(decoded.payment_id, Some("custom_unit".to_string()));
+	}
+
+	#[test]
+	fn test_custom_currency_unit_long() {
+		// Test a unit string longer than 23 bytes to exercise heap allocation
+		let long_unit = "this_is_a_very_long_unit_name";
+
+		let payment_request = CashuPaymentRequest {
+			payment_id: None,
+			amount: Some(100),
+			unit: Some(CurrencyUnit::custom(long_unit)),
+			single_use: None,
+			mints: None,
+			description: None,
+			transports: vec![],
+			nut10: None,
+		};
+
+		let encoded = payment_request.to_bech32_string().expect("encoding should work");
+		let decoded =
+			CashuPaymentRequest::from_bech32_string(&encoded).expect("decoding should work");
+
+		assert_eq!(decoded.unit, Some(CurrencyUnit::custom(long_unit)));
+		assert_eq!(decoded.amount, Some(100));
 	}
 
 	#[test]
