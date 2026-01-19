@@ -14,37 +14,52 @@ use bitcoin::bech32::{self, Bech32m, Hrp};
 /// Human-readable part for CREQ-B bech32m encoding
 pub const CREQ_B_HRP: &str = "creqb";
 
-/// Errors that can occur during parsing
+/// Errors that can occur during parsing and encoding of Cashu payment requests
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-	/// Invalid prefix
+	/// Invalid HRP prefix (must be `creqb`)
 	InvalidPrefix,
-	/// Invalid length
+	/// Invalid length of a TLV field or the overall structure
 	InvalidLength,
-	/// Invalid UTF-8
+	/// Invalid UTF-8 encoding in a string field
 	InvalidUtf8,
-	/// Unknown Kind
+	/// Unknown NUT-10 spending condition kind
 	UnknownKind(u8),
-	/// Bech32 error
+	/// Bech32 encoding/decoding error
 	Bech32,
-	/// Invalid TLV structure (missing required fields, unexpected values, etc.)
+	/// Invalid TLV structure (missing required fields, unexpected values, malformed TLV)
 	InvalidStructure,
 }
 
-/// Currency unit
+/// Supported Currency Units
+///
+/// A mint may support any currency unit(s) they can mint and melt, either directly or indirectly.
+/// Defined in [NUT-01](https://github.com/cashubtc/nuts/blob/main/01.md#supported-currency-units).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrencyUnit {
-	/// Satoshis
+	/// Bitcoin's Minor Unit (satoshis).
 	Sat,
-	/// Millisatoshis
+	/// Millisatoshis.
 	Msat,
-	/// US Dollars
+	/// US Dollars (ISO 4217 code `usd`).
+	/// Amounts represent cents (0.01 USD).
 	Usd,
-	/// Euro
+	/// Euro (ISO 4217 code `eur`).
+	/// Amounts represent cents (0.01 EUR).
 	Eur,
-	/// Auth
+	/// Reserved for Blind Authentication.
+	///
+	/// These are special tokens (BATs) used to access protected mint endpoints while maintaining privacy.
+	/// They function similarly to regular ecash but with a fixed amount of 1 and the unit `auth`.
+	///
+	/// In a payment request, this can be used to request access rights to a mint.
+	/// The sender authenticates with the mint, gets BATs, and transfers them to the receiver,
+	/// allowing the receiver to perform actions (like minting) on that mint without their own credentials.
+	///
+	/// See [NUT-22](https://github.com/cashubtc/nuts/blob/main/22.md).
 	Auth,
-	/// Custom unit
+	/// Custom unit (e.g., other ISO 4217 codes like `gbp`, `jpy`).
+	/// Note: There is no length limit for the unit string according to the spec.
 	Custom(String),
 }
 
@@ -83,45 +98,79 @@ impl From<TlvUnit> for CurrencyUnit {
 	}
 }
 
-/// Transport type
+/// The mechanism used to deliver the ecash token
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
-	/// Nostr transport
+	/// Send via Nostr Direct Message (NIP-17)
 	Nostr,
-	/// HTTP POST transport
+	/// Send via HTTP POST request
 	HttpPost,
-	/// In-band transport (implicit)
+	/// Implicit transport (e.g. in HTTP response or other protocol-specific channel).
+	/// See [NUT-24](https://github.com/cashubtc/nuts/blob/main/24.md) for an example.
 	InBand,
 }
 
-/// Transport configuration
+/// Transport configuration for sending ecash
+///
+/// Defines how and where the wallet should send the proofs (ecash) to fulfill the payment request.
+/// This allows the receiver to specify their preferred method of receiving the payment,
+/// such as via a Nostr direct message or an HTTP POST request.
+///
+/// The transport can be empty. If the transport is empty, it is implicitly assumed that the payment will be in-band.
+/// An example is [X-Cashu](https://github.com/cashubtc/nuts/blob/main/24.md) where the payment is expected in the HTTP header of a request.
+/// We can only hope that the protocol being used has a well-defined transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transport {
-	/// Transport kind (matches NUT-26 TLV field name)
+	/// The method of transport to use (e.g. Nostr, HTTP)
 	pub kind: TransportType,
-	/// Transport target
+	/// The target destination (e.g. nostr profile string, HTTP URL)
 	pub target: String,
-	/// Transport tags
+	/// Additional parameters for the transport (e.g. relays, specific NIPs)
+	///
+	/// For Nostr transports (`kind=0`), generic tag tuples are used.
+	/// - Key `"n"`: Specifies the NIPs the receiver supports (e.g., `["n", "17"]`).
+	/// - Key `"r"`: Specifies relay URLs (e.g., `["r", "wss://relay.damus.io"]`).
 	pub tags: Option<Vec<Vec<String>>>,
 }
 
-/// NUT-10 Kind
+/// NUT-10 Spending Condition Kind
+///
+/// Specifies the type of spending condition required for the token.
+/// These correspond to the "kind" field in NUT-10 spending conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-	/// Pay to Public Key
+	/// Pay to Public Key (P2PK)
+	///
+	/// Tokens are locked to a public key and require a valid signature to spend.
+	/// Defined in [NUT-11](https://github.com/cashubtc/nuts/blob/main/11.md).
 	P2PK,
-	/// Hash Time Locked Contract
+	/// Hash Time Locked Contract (HTLC)
+	///
+	/// Tokens are locked with a hash and/or a timelock.
+	/// Defined in [NUT-14](https://github.com/cashubtc/nuts/blob/main/14.md).
 	HTLC,
 }
 
 /// NUT-10 Spending Condition
+///
+/// Represents a requested spending condition for the ecash token.
+/// The payee can specify requirements for the token secret, such as locking it to a public key (P2PK) or a hash (HTLC).
+/// Defined in [NUT-10](https://github.com/cashubtc/nuts/blob/main/10.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nut10SecretRequest {
-	/// Kind
+	/// The type of spending condition (e.g., P2PK or HTLC).
 	pub kind: Kind,
-	/// Data
+	/// The data required for the spending condition.
+	///
+	/// - For P2PK, this is the 33-byte public key (hex-encoded).
+	/// - For HTLC, this is the 32-byte hash of the preimage (hex-encoded).
 	pub data: String,
-	/// Tags
+	/// Optional tags for additional conditions.
+	///
+	/// Common tags include:
+	/// - `["locktime", "<timestamp>"]`: Unix timestamp for time locks.
+	/// - `["refund", "<pubkey>"]`: Public key for refund spending condition.
+	/// - `["sig", "<signature>"]`: Signature for P2PK authorization.
 	pub tags: Option<Vec<Vec<String>>>,
 }
 
@@ -133,23 +182,30 @@ impl Nut10SecretRequest {
 }
 
 /// Cashu Payment Request
+///
+/// A standardised format for payment requests that supply a sending wallet with all information necessary to complete the transaction.
+/// Defined in [NUT-18](https://github.com/cashubtc/nuts/blob/main/18.md).
+/// The bech32 encoding is defined in [NUT-26](https://github.com/cashubtc/nuts/blob/main/26.md).
+/// Note: This crate currently only supports the bech32 encoding format (CREQ-B).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CashuPaymentRequest {
-	/// Payment ID
+	/// Payment ID to be included in the payment payload.
 	pub payment_id: Option<String>,
-	/// Amount
+	/// The amount of the requested payment.
 	pub amount: Option<u64>,
-	/// Unit
+	/// The unit of the requested payment.
+	/// MUST be set if `amount` is set.
 	pub unit: Option<CurrencyUnit>,
-	/// Single use flag
+	/// Whether the payment request is for single use.
 	pub single_use: Option<bool>,
-	/// Mints
+	/// A set of mints from which the payment is requested.
 	pub mints: Option<Vec<String>>,
-	/// Description
+	/// A human readable description that the sending wallet will display after scanning the request.
 	pub description: Option<String>,
-	/// Transports
+	/// The method of `Transport` chosen to transmit the payment.
+	/// Can be multiple, sorted by preference.
 	pub transports: Vec<Transport>,
-	/// NUT-10 spending conditions
+	/// The required NUT-10 spending conditions.
 	pub nut10: Option<Nut10SecretRequest>,
 }
 
@@ -224,6 +280,26 @@ impl fmt::Display for CashuPaymentRequest {
 
 impl CashuPaymentRequest {
 	/// Encodes a payment request to CREQB1 bech32m format.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use bitcoin_payment_instructions::cashu::{CashuPaymentRequest, CurrencyUnit};
+	///
+	/// let request = CashuPaymentRequest {
+	///     payment_id: Some("demo123".to_string()),
+	///     amount: Some(1000),
+	///     unit: Some(CurrencyUnit::Sat),
+	///     single_use: Some(true),
+	///     mints: Some(vec!["https://mint.example.com".to_string()]),
+	///     description: Some("Coffee payment".to_string()),
+	///     transports: vec![],
+	///     nut10: None,
+	/// };
+	///
+	/// let encoded = request.to_bech32_string().unwrap();
+	/// assert!(encoded.starts_with("CREQB1"));
+	/// ```
 	pub fn to_bech32_string(&self) -> Result<String, Error> {
 		let tlv_bytes = self.encode_tlv()?;
 		let hrp = Hrp::parse(CREQ_B_HRP).map_err(|_| Error::InvalidPrefix)?;
