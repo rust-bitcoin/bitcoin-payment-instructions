@@ -339,10 +339,16 @@ impl CashuPaymentRequest {
 			match tag {
 				0x01 => {
 					// id: string
+					if id.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					id = Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
 				},
 				0x02 => {
 					// amount: u64
+					if amount.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					if value.len() != 8 {
 						return Err(Error::InvalidLength);
 					}
@@ -354,6 +360,9 @@ impl CashuPaymentRequest {
 				},
 				0x03 => {
 					// unit: u8 or string
+					if unit.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					if value.len() == 1 && value[0] == 0 {
 						unit = Some(CurrencyUnit::Sat);
 					} else {
@@ -363,6 +372,9 @@ impl CashuPaymentRequest {
 				},
 				0x04 => {
 					// single_use: u8 (0 or 1)
+					if single_use.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					if !value.is_empty() {
 						single_use = Some(value[0] != 0);
 					}
@@ -374,6 +386,9 @@ impl CashuPaymentRequest {
 				},
 				0x06 => {
 					// description: string
+					if description.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					description = Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
 				},
 				0x07 => {
@@ -383,6 +398,9 @@ impl CashuPaymentRequest {
 				},
 				0x08 => {
 					// nut10: sub-TLV
+					if nut10.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					nut10 = Some(Self::decode_nut10(&value)?);
 				},
 				_ => {
@@ -475,6 +493,9 @@ impl CashuPaymentRequest {
 			match tag {
 				0x01 => {
 					// kind: u8
+					if kind.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					if value.len() != 1 {
 						return Err(Error::InvalidLength);
 					}
@@ -485,6 +506,9 @@ impl CashuPaymentRequest {
 					match kind {
 						Some(0x00) => {
 							// nostr: 32-byte x-only pubkey
+							if pubkey.is_some() {
+								return Err(Error::InvalidStructure);
+							}
 							if value.len() != 32 {
 								return Err(Error::InvalidLength);
 							}
@@ -492,6 +516,9 @@ impl CashuPaymentRequest {
 						},
 						Some(0x01) => {
 							// http_post: UTF-8 URL string
+							if http_target.is_some() {
+								return Err(Error::InvalidStructure);
+							}
 							http_target =
 								Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
 						},
@@ -631,6 +658,9 @@ impl CashuPaymentRequest {
 			match tag {
 				0x01 => {
 					// kind: u8
+					if kind.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					if value.len() != 1 {
 						return Err(Error::InvalidLength);
 					}
@@ -638,6 +668,9 @@ impl CashuPaymentRequest {
 				},
 				0x02 => {
 					// data: bytes
+					if data.is_some() {
+						return Err(Error::InvalidStructure);
+					}
 					data = Some(value);
 				},
 				0x03 | 0x05 => {
@@ -1801,5 +1834,54 @@ mod tests {
 
 		assert_eq!(decoded.unit, Some(CurrencyUnit::Custom("btc".to_string())));
 		assert_eq!(decoded.payment_id, Some("custom_unit".to_string()));
+	}
+
+	#[test]
+	fn test_duplicate_tlv_fields() {
+		// 1. Top-level: Duplicate Amount (Tag 0x02)
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x02, &100u64.to_be_bytes());
+		writer.write_tlv(0x02, &200u64.to_be_bytes());
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::from_bech32_bytes(&bytes), Err(Error::InvalidStructure));
+
+		// 2. Transport: Duplicate Kind (Tag 0x01)
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x01, &[0x00]); // Nostr
+		writer.write_tlv(0x01, &[0x01]); // HTTP
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::decode_transport(&bytes), Err(Error::InvalidStructure));
+
+		// 3. Transport: Duplicate Target (Tag 0x02) for Nostr
+		let pubkey = vec![0u8; 32];
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x01, &[0x00]); // Kind Nostr
+		writer.write_tlv(0x02, &pubkey);
+		writer.write_tlv(0x02, &pubkey);
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::decode_transport(&bytes), Err(Error::InvalidStructure));
+
+		// 4. Transport: Duplicate Target (Tag 0x02) for HTTP
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x01, &[0x01]); // Kind HTTP
+		writer.write_tlv(0x02, b"https://example.com");
+		writer.write_tlv(0x02, b"https://example.org");
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::decode_transport(&bytes), Err(Error::InvalidStructure));
+
+		// 5. NUT-10: Duplicate Kind (Tag 0x01)
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x01, &[0x00]); // Kind P2PK
+		writer.write_tlv(0x01, &[0x01]); // Kind HTLC
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::decode_nut10(&bytes), Err(Error::InvalidStructure));
+
+		// 6. NUT-10: Duplicate Data (Tag 0x02)
+		let mut writer = TlvWriter::new();
+		writer.write_tlv(0x01, &[0x00]); // Kind P2PK
+		writer.write_tlv(0x02, b"data1");
+		writer.write_tlv(0x02, b"data2");
+		let bytes = writer.into_bytes();
+		assert_eq!(CashuPaymentRequest::decode_nut10(&bytes), Err(Error::InvalidStructure));
 	}
 }
