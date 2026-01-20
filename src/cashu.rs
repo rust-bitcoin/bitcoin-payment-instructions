@@ -194,7 +194,7 @@ pub enum TransportType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagTuple {
 	/// The tag key (e.g., "n" for NIPs, "relay" for relays, "locktime" for timelocks)
-	key: String,
+	key: UnitString,
 	/// The tag values
 	values: Vec<String>,
 }
@@ -212,7 +212,7 @@ impl TagTuple {
 				return Err(Error::InvalidLength);
 			}
 		}
-		Ok(Self { key: key.to_string(), values })
+		Ok(Self { key: UnitString::new(key), values })
 	}
 
 	/// Create a tag tuple with a single value.
@@ -222,7 +222,7 @@ impl TagTuple {
 		if key.len() > u8::MAX as usize || value.len() > u8::MAX as usize {
 			return Err(Error::InvalidLength);
 		}
-		Ok(Self { key: key.to_string(), values: vec![value.to_string()] })
+		Ok(Self { key: UnitString::new(key), values: vec![value.to_string()] })
 	}
 
 	/// Returns the tag key.
