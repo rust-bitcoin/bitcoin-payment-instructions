@@ -820,9 +820,7 @@ impl CashuPaymentRequest {
 
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
-						if tag.key() == "n" && !tag.values().is_empty() {
-							Self::encode_tag_tuple_into(tag, writer);
-						} else if tag.key() == "relay" && !tag.values().is_empty() {
+						if tag.key() == "relay" && !tag.values().is_empty() {
 							all_relays.push(tag.values()[0].clone());
 						} else {
 							Self::encode_tag_tuple_into(tag, writer);
