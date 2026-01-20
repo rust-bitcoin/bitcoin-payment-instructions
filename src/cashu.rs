@@ -254,7 +254,7 @@ pub struct Transport {
 	///
 	/// For Nostr transports (`kind=0`), generic tag tuples are used.
 	/// - Key `"n"`: Specifies the NIPs the receiver supports (e.g., `TagTuple::single("n", "17")`).
-	/// - Key `"relay"`: Specifies relay URLs (e.g., `TagTuple::single("relay", "wss://relay.damus.io")`).
+	/// - Key `"relay"`: Specifies relay URLs (e.g., `TagTuple::new("relay", vec!["wss://relay.damus.io", "wss://nos.lol"])`).
 	pub tags: Option<Vec<TagTuple>>,
 }
 
@@ -779,15 +779,17 @@ impl CashuPaymentRequest {
 		};
 
 		let mut final_tags: Vec<TagTuple> = Vec::new();
+		let mut all_relays: Vec<String> = Vec::new();
 		for (key, values) in tags {
 			if key == "r" {
-				for relay in values {
-					final_tags.push(TagTuple::single("relay", relay)?);
-				}
+				all_relays.extend(values.into_iter().map(String::from));
 			} else {
 				final_tags
 					.push(TagTuple::new(key, values.into_iter().map(String::from).collect())?);
 			}
+		}
+		if !all_relays.is_empty() {
+			final_tags.push(TagTuple::new("relay", all_relays)?);
 		}
 
 		Ok(Transport {
@@ -820,8 +822,8 @@ impl CashuPaymentRequest {
 
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
-						if tag.key() == "relay" && !tag.values().is_empty() {
-							all_relays.push(tag.values()[0].clone());
+						if tag.key() == "relay" {
+							all_relays.extend(tag.values().iter().cloned());
 						} else {
 							Self::encode_tag_tuple_into(tag, writer);
 						}
@@ -1031,7 +1033,8 @@ impl CashuPaymentRequest {
 			return Err(Error::InvalidLength);
 		}
 
-		let mut tlv_bytes = Vec::new();
+		let capacity = 34 + relays.iter().map(|r| 2 + r.len()).sum::<usize>();
+		let mut tlv_bytes = Vec::with_capacity(capacity);
 
 		// Type 0: pubkey (32 bytes)
 		tlv_bytes.push(0);
@@ -1481,12 +1484,9 @@ mod tests {
 		assert!(tags2
 			.iter()
 			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("44")));
-		assert!(tags2.iter().any(|t| t.key == "relay"
-			&& t.values.first().map(|s| s.as_str()) == Some("wss://relay.damus.io")));
-		assert!(tags2
-			.iter()
-			.any(|t| t.key == "relay"
-				&& t.values.first().map(|s| s.as_str()) == Some("wss://nos.lol")));
+		let relay_tag = tags2.iter().find(|t| t.key == "relay").expect("should have relay tag");
+		assert!(relay_tag.values.contains(&"wss://relay.damus.io".to_string()));
+		assert!(relay_tag.values.contains(&"wss://nos.lol".to_string()));
 	}
 
 	#[test]
@@ -1737,12 +1737,12 @@ mod tests {
 		let decoded =
 			CashuPaymentRequest::from_bech32_string(&encoded).expect("decoding should work");
 
-		// Verify relays were extracted and converted to "relay" tags
+		// Verify relays were extracted and converted to a single "relay" tag
 		let tags = decoded.transports[0].tags.as_ref().expect("should have tags");
 
-		// Check all three relays are present as "relay" tags
-		let relay_tags: Vec<&TagTuple> = tags.iter().filter(|t| t.key == "relay").collect();
-		assert_eq!(relay_tags.len(), 3);
+		// Check all three relays are present in the single "relay" tag
+		let relay_tag = tags.iter().find(|t| t.key == "relay").expect("should have relay tag");
+		assert_eq!(relay_tag.values.len(), 3);
 
 		// Verify the nprofile is preserved (relays are encoded back into it)
 		assert_eq!(
