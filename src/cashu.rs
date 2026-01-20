@@ -193,20 +193,45 @@ pub enum TransportType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagTuple {
 	/// The tag key (e.g., "n" for NIPs, "relay" for relays, "locktime" for timelocks)
-	pub key: String,
+	key: String,
 	/// The tag values
-	pub values: Vec<String>,
+	values: Vec<String>,
 }
 
 impl TagTuple {
-	/// Create a new tag tuple with a key and values
-	pub fn new(key: &str, values: Vec<String>) -> Self {
-		Self { key: key.to_string(), values }
+	/// Create a new tag tuple with a key and values.
+	///
+	/// Returns an error if the key or any value exceeds 255 bytes.
+	pub fn new(key: &str, values: Vec<String>) -> Result<Self, Error> {
+		if key.len() > u8::MAX as usize {
+			return Err(Error::InvalidLength);
+		}
+		for value in &values {
+			if value.len() > u8::MAX as usize {
+				return Err(Error::InvalidLength);
+			}
+		}
+		Ok(Self { key: key.to_string(), values })
 	}
 
-	/// Create a tag tuple with a single value
-	pub fn single(key: &str, value: &str) -> Self {
-		Self { key: key.to_string(), values: vec![value.to_string()] }
+	/// Create a tag tuple with a single value.
+	///
+	/// Returns an error if the key or value exceeds 255 bytes.
+	pub fn single(key: &str, value: &str) -> Result<Self, Error> {
+		if key.len() > u8::MAX as usize || value.len() > u8::MAX as usize {
+			return Err(Error::InvalidLength);
+		}
+		Ok(Self { key: key.to_string(), values: vec![value.to_string()] })
+	}
+
+	/// Returns the tag key.
+	pub fn key(&self) -> &str {
+		&self.key
+	}
+
+	/// Returns the tag values.
+	pub fn values(&self) -> &[String] {
+		&self.values
 	}
 }
 
@@ -757,10 +782,11 @@ impl CashuPaymentRequest {
 		for (key, values) in tags {
 			if key == "r" {
 				for relay in values {
-					final_tags.push(TagTuple::single("relay", relay));
+					final_tags.push(TagTuple::single("relay", relay)?);
 				}
 			} else {
-				final_tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect()));
+				final_tags
+					.push(TagTuple::new(key, values.into_iter().map(String::from).collect())?);
 			}
 		}
 
@@ -794,10 +820,10 @@ impl CashuPaymentRequest {
 
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
-						if tag.key == "n" && !tag.values.is_empty() {
+						if tag.key() == "n" && !tag.values().is_empty() {
 							Self::encode_tag_tuple_into(tag, writer);
-						} else if tag.key == "relay" && !tag.values.is_empty() {
-							all_relays.push(tag.values[0].clone());
+						} else if tag.key() == "relay" && !tag.values().is_empty() {
+							all_relays.push(tag.values()[0].clone());
 						} else {
 							Self::encode_tag_tuple_into(tag, writer);
 						}
@@ -805,7 +831,7 @@ impl CashuPaymentRequest {
 				}
 
 				for relay in all_relays {
-					Self::encode_tag_tuple_into(&TagTuple::single("r", relay), writer);
+					Self::encode_tag_tuple_into(&TagTuple::single("r", &relay)?, writer);
 				}
 			},
 			TransportType::HttpPost => {
@@ -855,7 +881,7 @@ impl CashuPaymentRequest {
 				0x03 | 0x05 => {
 					// tag_tuple: generic tuple (repeatable)
 					let (key, values) = Self::decode_tag_tuple(value)?;
-					tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect()));
+					tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect())?);
 				},
 				_ => {
 					// Unknown tags are ignored
@@ -940,11 +966,11 @@ impl CashuPaymentRequest {
 		let mut w = writer.nested(0x03);
 
 		// Key length + key
-		w.write_byte(tag.key.len() as u8);
-		w.write_raw(tag.key.as_bytes());
+		w.write_byte(tag.key().len() as u8);
+		w.write_raw(tag.key().as_bytes());
 
 		// Values
-		for value in &tag.values {
+		for value in tag.values() {
 			w.write_byte(value.len() as u8);
 			w.write_raw(value.as_bytes());
 		}
@@ -1095,7 +1121,7 @@ mod tests {
 		let nut10 = Nut10SecretRequest::new(
 			Kind::P2PK,
 			"026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
-			Some(vec![TagTuple::single("timeout", "3600")]),
+			Some(vec![TagTuple::single("timeout", "3600").unwrap()]),
 		);
 
 		let payment_request = CashuPaymentRequest {
@@ -1224,7 +1250,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile.clone(),
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1267,7 +1293,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile.clone(),
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1312,7 +1338,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile,
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1368,13 +1394,16 @@ mod tests {
 		let transport1 = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile1.clone(),
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 
 		let transport2 = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile2.clone(),
-			tags: Some(vec![TagTuple::single("n", "17"), TagTuple::single("n", "44")]),
+			tags: Some(vec![
+				TagTuple::single("n", "17").unwrap(),
+				TagTuple::single("n", "44").unwrap(),
+			]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1486,7 +1515,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsgm6qfa3c8dtz2fvzhvfqeacmwm0e50pe3k5tfmvpjjmn0vj7m2tgpz3mhxue69uhhyetvv9ujuerpd46hxtnfduq3wamnwvaz7tmjv4kxz7fw8qenxvewwdcxzcm99uqs6amnwvaz7tmwdaejumr0ds4ljh7n".to_string(),
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1532,7 +1561,10 @@ mod tests {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8uzqt"
 				.to_string(),
-			tags: Some(vec![TagTuple::single("n", "17"), TagTuple::single("n", "9735")]),
+			tags: Some(vec![
+				TagTuple::single("n", "17").unwrap(),
+				TagTuple::single("n", "9735").unwrap(),
+			]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1589,7 +1621,7 @@ mod tests {
 		let nut10 = Nut10SecretRequest {
 			kind: Kind::P2PK,
 			data: "02c3b5bb27e361457c92d93d78dd73d3d53732110b2cfe8b50fbc0abc615e9c331".to_string(),
-			tags: Some(vec![TagTuple::single("timeout", "3600")]),
+			tags: Some(vec![TagTuple::single("timeout", "3600").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1640,7 +1672,8 @@ mod tests {
 			tags: Some(vec![TagTuple::new(
 				"custom",
 				vec!["value1".to_string(), "value2".to_string()],
-			)]),
+			)
+			.unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1728,7 +1761,7 @@ mod tests {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24mayt8g2lcy6q"
 				.to_string(),
-			tags: Some(vec![TagTuple::single("n", "17")]),
+			tags: Some(vec![TagTuple::single("n", "17").unwrap()]),
 		};
 		let t2 = Transport {
 			kind: TransportType::HttpPost,
@@ -1738,7 +1771,7 @@ mod tests {
 		let t3 = Transport {
 			kind: TransportType::HttpPost,
 			target: "https://api2.example.com/payment".to_string(),
-			tags: Some(vec![TagTuple::single("priority", "backup")]),
+			tags: Some(vec![TagTuple::single("priority", "backup").unwrap()]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1896,11 +1929,12 @@ mod tests {
 			kind: Kind::HTLC,
 			data: "a]0e66820bfb412212cf7ab3deb0459ce282a1b04fda76ea6026a67e41ae26f3dc".to_string(),
 			tags: Some(vec![
-				TagTuple::single("locktime", "1700000000"),
+				TagTuple::single("locktime", "1700000000").unwrap(),
 				TagTuple::single(
 					"refund",
 					"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e",
-				),
+				)
+				.unwrap(),
 			]),
 		};
 
@@ -1942,13 +1976,14 @@ mod tests {
 		// Verify all tags with exact values
 		let tags = nut10.tags.as_ref().unwrap();
 		assert_eq!(tags.len(), 2);
-		assert_eq!(tags[0], TagTuple::single("locktime", "1700000000"));
+		assert_eq!(tags[0], TagTuple::single("locktime", "1700000000").unwrap());
 		assert_eq!(
 			tags[1],
 			TagTuple::single(
 				"refund",
 				"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e"
 			)
+			.unwrap()
 		);
 	}
 
