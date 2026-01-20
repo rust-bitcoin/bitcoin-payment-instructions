@@ -972,7 +972,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: vec![PaymentMethod::Cashu(creq)],
 			onchain_amt: None,
-			ln_amt: None, // This will be filled by PaymentInstructions accessors if unit is sat/msat
+			ln_amt: None,
 			cashu_amt,
 			lnurl: None,
 			pop_callback: None,

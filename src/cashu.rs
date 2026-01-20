@@ -192,7 +192,7 @@ pub enum TransportType {
 /// In JSON, this is represented as `["key", "value1", "value2", ...]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagTuple {
-	/// The tag key (e.g., "n" for NIPs, "r" for relays, "locktime" for timelocks)
+	/// The tag key (e.g., "n" for NIPs, "relay" for relays, "locktime" for timelocks)
 	pub key: String,
 	/// The tag values
 	pub values: Vec<String>,
