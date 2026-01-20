@@ -174,15 +174,16 @@ impl CurrencyUnit {
 }
 
 /// The mechanism used to deliver the ecash token
+///
+/// Note: If the transport list is empty, it is implicitly assumed that the payment
+/// will be delivered in-band (e.g., in an HTTP response header as in
+/// [X-Cashu/NUT-24](https://github.com/cashubtc/nuts/blob/main/24.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
 	/// Send via Nostr Direct Message (NIP-17)
 	Nostr,
 	/// Send via HTTP POST request
 	HttpPost,
-	/// Implicit transport (e.g. in HTTP response or other protocol-specific channel).
-	/// See [NUT-24](https://github.com/cashubtc/nuts/blob/main/24.md) for an example.
-	InBand,
 }
 
 /// A tag tuple containing a key and zero or more values.
@@ -678,9 +679,6 @@ impl CashuPaymentRequest {
 
 		// 0x07 transport: sub-TLV (repeatable, order = priority)
 		for transport in &self.transports {
-			if transport.kind == TransportType::InBand {
-				continue;
-			}
 			let mut w = SingleTlvWriter::new(&mut writer, 0x07);
 			Self::encode_transport_into(transport, &mut w)?;
 		}
@@ -773,9 +771,6 @@ impl CashuPaymentRequest {
 				}
 			},
 			TransportType::HttpPost => http_target.ok_or(Error::InvalidStructure)?,
-			TransportType::InBand => {
-				unreachable!()
-			},
 		};
 
 		let mut final_tags: Vec<TagTuple> = Vec::new();
@@ -804,9 +799,6 @@ impl CashuPaymentRequest {
 		transport: &Transport, writer: &mut SingleTlvWriter<'_>,
 	) -> Result<(), Error> {
 		let kind = match transport.kind {
-			TransportType::InBand => {
-				return Err(Error::InvalidStructure);
-			},
 			TransportType::Nostr => 0x00u8,
 			TransportType::HttpPost => 0x01u8,
 		};
@@ -842,9 +834,6 @@ impl CashuPaymentRequest {
 						Self::encode_tag_tuple_into(tag, writer);
 					}
 				}
-			},
-			TransportType::InBand => {
-				unreachable!()
 			},
 		}
 
@@ -1885,38 +1874,6 @@ mod tests {
 		assert_eq!(decoded.transports[0].kind, TransportType::HttpPost);
 		assert_eq!(decoded.transports[0].target, "https://api.example.com");
 		assert!(decoded.transports[0].tags.is_none());
-	}
-
-	#[test]
-	fn test_in_band_transport_implicit() {
-		let transport = Transport {
-			kind: TransportType::InBand,
-			target: String::new(), // In-band has no target
-			tags: None,
-		};
-
-		let payment_request = CashuPaymentRequest {
-			payment_id: Some("in_band_test".to_string()),
-			amount: Some(100),
-			unit: Some(CurrencyUnit::Sat),
-			single_use: None,
-			mints: Some(vec!["https://mint.example.com".to_string()]),
-			description: None,
-			transports: vec![transport],
-			nut10: None,
-		};
-
-		let encoded = payment_request.to_bech32_string().expect("encoding should work");
-
-		// Decode the encoded string
-		let decoded =
-			CashuPaymentRequest::from_bech32_string(&encoded).expect("decoding should work");
-
-		// In-band transports are not encoded, so when decoded, transports should be empty
-		// (absence of transport tag = in-band is implicit)
-		assert_eq!(decoded.transports.len(), 0);
-		assert_eq!(decoded.payment_id, Some("in_band_test".to_string()));
-		assert_eq!(decoded.amount, Some(100));
 	}
 
 	#[test]
