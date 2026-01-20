@@ -697,9 +697,8 @@ impl CashuPaymentRequest {
 		let mut reader = TlvReader::new(bytes);
 
 		let mut kind: Option<u8> = None;
-		let mut pubkey: Option<&[u8]> = None;
+		let mut raw_target: Option<&[u8]> = None;
 		let mut tags: Vec<(&str, Vec<&str>)> = Vec::new();
-		let mut http_target: Option<String> = None;
 
 		while let Some((tag, value)) = reader.read_tlv()? {
 			match tag {
@@ -714,33 +713,11 @@ impl CashuPaymentRequest {
 					kind = Some(value[0]);
 				},
 				0x02 => {
-					// target: bytes
-					match kind {
-						Some(0x00) => {
-							// nostr: 32-byte x-only pubkey
-							if pubkey.is_some() {
-								return Err(Error::InvalidStructure);
-							}
-							if value.len() != 32 {
-								return Err(Error::InvalidLength);
-							}
-							pubkey = Some(value);
-						},
-						Some(0x01) => {
-							// http_post: UTF-8 URL string
-							if http_target.is_some() {
-								return Err(Error::InvalidStructure);
-							}
-							http_target = Some(
-								String::from_utf8(value.to_vec())
-									.map_err(|_| Error::InvalidUtf8)?,
-							);
-						},
-						None => {
-							// kind should always be present if there's a target
-						},
-						_ => return Err(Error::InvalidStructure),
+					// target: bytes (store raw, interpret after loop based on kind)
+					if raw_target.is_some() {
+						return Err(Error::InvalidStructure);
 					}
+					raw_target = Some(value);
 				},
 				0x03 => {
 					// tag_tuple: generic tuple (repeatable)
@@ -762,15 +739,20 @@ impl CashuPaymentRequest {
 		let relays: Vec<&str> =
 			tags.iter().filter(|(k, _)| *k == "r").flat_map(|(_, v)| v.iter().copied()).collect();
 
+		// Interpret raw target bytes based on kind
+		let raw_target = raw_target.ok_or(Error::InvalidStructure)?;
 		let target = match transport_type {
 			TransportType::Nostr => {
-				if let Some(pk) = pubkey {
-					Self::encode_nprofile(pk, &relays)?
-				} else {
-					return Err(Error::InvalidStructure);
+				// nostr: 32-byte x-only pubkey
+				if raw_target.len() != 32 {
+					return Err(Error::InvalidLength);
 				}
+				Self::encode_nprofile(raw_target, &relays)?
 			},
-			TransportType::HttpPost => http_target.ok_or(Error::InvalidStructure)?,
+			TransportType::HttpPost => {
+				// http_post: UTF-8 URL string
+				String::from_utf8(raw_target.to_vec()).map_err(|_| Error::InvalidUtf8)?
+			},
 		};
 
 		let mut final_tags: Vec<TagTuple> = Vec::new();
@@ -2023,6 +2005,37 @@ mod tests {
 
 		assert_eq!(decoded.unit, Some(CurrencyUnit::custom(long_unit)));
 		assert_eq!(decoded.amount, Some(100));
+	}
+
+	#[test]
+	fn test_transport_tlv_ordering_target_before_kind() {
+		// TLV fields should be order-independent. This test verifies that
+		// target (0x02) can appear before kind (0x01) and still decode correctly.
+
+		// Test 1: Nostr transport with target before kind
+		let pubkey = [0x42u8; 32]; // 32-byte x-only pubkey
+		let mut writer = TlvWriter::with_capacity(64);
+		writer.write_tlv(0x02, &pubkey); // Target first
+		writer.write_tlv(0x01, &[0x00]); // Kind Nostr second
+		let bytes = writer.into_bytes();
+
+		let transport = CashuPaymentRequest::decode_transport(&bytes)
+			.expect("should decode transport with target before kind");
+		assert_eq!(transport.kind, TransportType::Nostr);
+		// Target should be encoded as nprofile (even with no relays)
+		assert!(transport.target.starts_with("nprofile"));
+
+		// Test 2: HTTP transport with target before kind
+		let url = b"https://example.com/callback";
+		let mut writer = TlvWriter::with_capacity(64);
+		writer.write_tlv(0x02, url); // Target first
+		writer.write_tlv(0x01, &[0x01]); // Kind HTTP second
+		let bytes = writer.into_bytes();
+
+		let transport = CashuPaymentRequest::decode_transport(&bytes)
+			.expect("should decode HTTP transport with target before kind");
+		assert_eq!(transport.kind, TransportType::HttpPost);
+		assert_eq!(transport.target, "https://example.com/callback");
 	}
 
 	#[test]
