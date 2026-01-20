@@ -185,6 +185,31 @@ pub enum TransportType {
 	InBand,
 }
 
+/// A tag tuple containing a key and zero or more values.
+///
+/// This represents the generic tag format used in NUT-18/NUT-26 for both
+/// transport tags and NUT-10 spending condition tags.
+/// In JSON, this is represented as `["key", "value1", "value2", ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagTuple {
+	/// The tag key (e.g., "n" for NIPs, "r" for relays, "locktime" for timelocks)
+	pub key: String,
+	/// The tag values
+	pub values: Vec<String>,
+}
+
+impl TagTuple {
+	/// Create a new tag tuple with a key and values
+	pub fn new(key: &str, values: Vec<String>) -> Self {
+		Self { key: key.to_string(), values }
+	}
+
+	/// Create a tag tuple with a single value
+	pub fn single(key: &str, value: &str) -> Self {
+		Self { key: key.to_string(), values: vec![value.to_string()] }
+	}
+}
+
 /// Transport configuration for sending ecash
 ///
 /// Defines how and where the wallet should send the proofs (ecash) to fulfill the payment request.
@@ -203,9 +228,9 @@ pub struct Transport {
 	/// Additional parameters for the transport (e.g. relays, specific NIPs)
 	///
 	/// For Nostr transports (`kind=0`), generic tag tuples are used.
-	/// - Key `"n"`: Specifies the NIPs the receiver supports (e.g., `["n", "17"]`).
-	/// - Key `"r"`: Specifies relay URLs (e.g., `["r", "wss://relay.damus.io"]`).
-	pub tags: Option<Vec<Vec<String>>>,
+	/// - Key `"n"`: Specifies the NIPs the receiver supports (e.g., `TagTuple::single("n", "17")`).
+	/// - Key `"relay"`: Specifies relay URLs (e.g., `TagTuple::single("relay", "wss://relay.damus.io")`).
+	pub tags: Option<Vec<TagTuple>>,
 }
 
 /// NUT-10 Spending Condition Kind
@@ -243,15 +268,15 @@ pub struct Nut10SecretRequest {
 	/// Optional tags for additional conditions.
 	///
 	/// Common tags include:
-	/// - `["locktime", "<timestamp>"]`: Unix timestamp for time locks.
-	/// - `["refund", "<pubkey>"]`: Public key for refund spending condition.
-	/// - `["sig", "<signature>"]`: Signature for P2PK authorization.
-	pub tags: Option<Vec<Vec<String>>>,
+	/// - `TagTuple::single("locktime", "<timestamp>")`: Unix timestamp for time locks.
+	/// - `TagTuple::single("refund", "<pubkey>")`: Public key for refund spending condition.
+	/// - `TagTuple::single("sig", "<signature>")`: Signature for P2PK authorization.
+	pub tags: Option<Vec<TagTuple>>,
 }
 
 impl Nut10SecretRequest {
 	/// Create a new NUT-10 secret request
-	pub fn new(kind: Kind, data: &str, tags: Option<Vec<Vec<String>>>) -> Self {
+	pub fn new(kind: Kind, data: &str, tags: Option<Vec<TagTuple>>) -> Self {
 		Self { kind, data: data.to_string(), tags }
 	}
 }
@@ -728,16 +753,14 @@ impl CashuPaymentRequest {
 			},
 		};
 
-		let mut final_tags: Vec<Vec<String>> = Vec::new();
+		let mut final_tags: Vec<TagTuple> = Vec::new();
 		for (key, values) in tags {
 			if key == "r" {
 				for relay in values {
-					final_tags.push(vec!["relay".to_string(), relay.to_string()]);
+					final_tags.push(TagTuple::single("relay", relay));
 				}
 			} else {
-				let mut v = vec![key.to_string()];
-				v.extend(values.into_iter().map(String::from));
-				final_tags.push(v);
+				final_tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect()));
 			}
 		}
 
@@ -771,22 +794,18 @@ impl CashuPaymentRequest {
 
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
-						if tag.is_empty() {
-							continue;
-						}
-						if tag[0] == "n" && tag.len() >= 2 {
-							Self::encode_tag_tuple_into(tag, writer)?;
-						} else if tag[0] == "relay" && tag.len() >= 2 {
-							all_relays.push(tag[1].clone());
+						if tag.key == "n" && !tag.values.is_empty() {
+							Self::encode_tag_tuple_into(tag, writer);
+						} else if tag.key == "relay" && !tag.values.is_empty() {
+							all_relays.push(tag.values[0].clone());
 						} else {
-							Self::encode_tag_tuple_into(tag, writer)?;
+							Self::encode_tag_tuple_into(tag, writer);
 						}
 					}
 				}
 
 				for relay in all_relays {
-					let relay_tag = vec!["r".to_string(), relay];
-					Self::encode_tag_tuple_into(&relay_tag, writer)?;
+					Self::encode_tag_tuple_into(&TagTuple::single("r", relay), writer);
 				}
 			},
 			TransportType::HttpPost => {
@@ -794,9 +813,7 @@ impl CashuPaymentRequest {
 
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
-						if !tag.is_empty() {
-							Self::encode_tag_tuple_into(tag, writer)?;
-						}
+						Self::encode_tag_tuple_into(tag, writer);
 					}
 				}
 			},
@@ -814,7 +831,7 @@ impl CashuPaymentRequest {
 
 		let mut kind: Option<u8> = None;
 		let mut data: Option<Vec<u8>> = None;
-		let mut tags: Vec<Vec<String>> = Vec::new();
+		let mut tags: Vec<TagTuple> = Vec::new();
 
 		while let Some((tag, value)) = reader.read_tlv()? {
 			match tag {
@@ -837,10 +854,8 @@ impl CashuPaymentRequest {
 				},
 				0x03 | 0x05 => {
 					// tag_tuple: generic tuple (repeatable)
-					let tag_tuple = Self::decode_tag_tuple(value)?;
-					let mut v = vec![tag_tuple.0.to_string()];
-					v.extend(tag_tuple.1.into_iter().map(String::from));
-					tags.push(v);
+					let (key, values) = Self::decode_tag_tuple(value)?;
+					tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect()));
 				},
 				_ => {
 					// Unknown tags are ignored
@@ -879,7 +894,7 @@ impl CashuPaymentRequest {
 
 		if let Some(ref tags) = nut10.tags {
 			for tag in tags {
-				Self::encode_tag_tuple_into(tag, writer)?;
+				Self::encode_tag_tuple_into(tag, writer);
 			}
 		}
 
@@ -921,27 +936,18 @@ impl CashuPaymentRequest {
 
 	/// Encode tag tuple directly into the provided writer to avoid intermediate allocations.
 	/// Writes as a 0x03 sub-TLV (tag + length + key/values).
-	fn encode_tag_tuple_into(
-		tag: &[String], writer: &mut SingleTlvWriter<'_>,
-	) -> Result<(), Error> {
-		if tag.is_empty() {
-			return Err(Error::InvalidLength);
-		}
-
+	fn encode_tag_tuple_into(tag: &TagTuple, writer: &mut SingleTlvWriter<'_>) {
 		let mut w = writer.nested(0x03);
 
 		// Key length + key
-		let key = &tag[0];
-		w.write_byte(key.len() as u8);
-		w.write_raw(key.as_bytes());
+		w.write_byte(tag.key.len() as u8);
+		w.write_raw(tag.key.as_bytes());
 
 		// Values
-		for value in &tag[1..] {
+		for value in &tag.values {
 			w.write_byte(value.len() as u8);
 			w.write_raw(value.as_bytes());
 		}
-
-		Ok(())
 	}
 
 	/// Decode nprofile bech32 string to (pubkey, relays)
@@ -1089,7 +1095,7 @@ mod tests {
 		let nut10 = Nut10SecretRequest::new(
 			Kind::P2PK,
 			"026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
-			Some(vec![vec!["timeout".to_string(), "3600".to_string()]]),
+			Some(vec![TagTuple::single("timeout", "3600")]),
 		);
 
 		let payment_request = CashuPaymentRequest {
@@ -1218,7 +1224,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile.clone(),
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1244,7 +1250,9 @@ mod tests {
 
 		// Check that NIP-17 tag was preserved
 		let tags = decoded.transports[0].tags.as_ref().unwrap();
-		assert!(tags.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "17"));
+		assert!(tags
+			.iter()
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("17")));
 	}
 
 	#[test]
@@ -1259,7 +1267,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile.clone(),
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1287,9 +1295,8 @@ mod tests {
 
 		// Check that relay was preserved in tags
 		let tags = decoded.transports[0].tags.as_ref().unwrap();
-		assert!(tags
-			.iter()
-			.any(|t| t.len() >= 2 && t[0] == "relay" && t[1] == "wss://relay.example.com"));
+		assert!(tags.iter().any(|t| t.key == "relay"
+			&& t.values.first().map(|s| s.as_str()) == Some("wss://relay.example.com")));
 	}
 
 	#[test]
@@ -1305,7 +1312,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile,
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1336,10 +1343,11 @@ mod tests {
 
 		// Verify relay and NIP are preserved
 		let tags = decoded.transports[0].tags.as_ref().unwrap();
-		assert!(tags.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "17"));
 		assert!(tags
 			.iter()
-			.any(|t| t.len() >= 2 && t[0] == "relay" && t[1] == "wss://relay.damus.io"));
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("17")));
+		assert!(tags.iter().any(|t| t.key == "relay"
+			&& t.values.first().map(|s| s.as_str()) == Some("wss://relay.damus.io")));
 	}
 
 	#[test]
@@ -1360,16 +1368,13 @@ mod tests {
 		let transport1 = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile1.clone(),
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 
 		let transport2 = Transport {
 			kind: TransportType::Nostr,
 			target: nprofile2.clone(),
-			tags: Some(vec![
-				vec!["n".to_string(), "17".to_string()],
-				vec!["n".to_string(), "44".to_string()],
-			]),
+			tags: Some(vec![TagTuple::single("n", "17"), TagTuple::single("n", "44")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1425,7 +1430,9 @@ mod tests {
 
 		// Verify NIP-17 tag
 		let tags1 = transport1_decoded.tags.as_ref().unwrap();
-		assert!(tags1.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "17"));
+		assert!(tags1
+			.iter()
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("17")));
 
 		// Verify second transport (nprofile)
 		let transport2_decoded = &decoded.transports[1];
@@ -1441,12 +1448,18 @@ mod tests {
 
 		// Verify tags include both NIPs and relays
 		let tags2 = transport2_decoded.tags.as_ref().unwrap();
-		assert!(tags2.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "17"));
-		assert!(tags2.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "44"));
 		assert!(tags2
 			.iter()
-			.any(|t| t.len() >= 2 && t[0] == "relay" && t[1] == "wss://relay.damus.io"));
-		assert!(tags2.iter().any(|t| t.len() >= 2 && t[0] == "relay" && t[1] == "wss://nos.lol"));
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("17")));
+		assert!(tags2
+			.iter()
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("44")));
+		assert!(tags2.iter().any(|t| t.key == "relay"
+			&& t.values.first().map(|s| s.as_str()) == Some("wss://relay.damus.io")));
+		assert!(tags2
+			.iter()
+			.any(|t| t.key == "relay"
+				&& t.values.first().map(|s| s.as_str()) == Some("wss://nos.lol")));
 	}
 
 	#[test]
@@ -1473,7 +1486,7 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsgm6qfa3c8dtz2fvzhvfqeacmwm0e50pe3k5tfmvpjjmn0vj7m2tgpz3mhxue69uhhyetvv9ujuerpd46hxtnfduq3wamnwvaz7tmjv4kxz7fw8qenxvewwdcxzcm99uqs6amnwvaz7tmwdaejumr0ds4ljh7n".to_string(),
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1506,7 +1519,9 @@ mod tests {
 		assert_eq!(decoded.transports.len(), 1);
 		assert_eq!(decoded.transports[0].kind, TransportType::Nostr);
 		let tags = decoded.transports[0].tags.as_ref().unwrap();
-		assert!(tags.iter().any(|t| t.len() >= 2 && t[0] == "n" && t[1] == "17"));
+		assert!(tags
+			.iter()
+			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("17")));
 	}
 
 	#[test]
@@ -1517,10 +1532,7 @@ mod tests {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8uzqt"
 				.to_string(),
-			tags: Some(vec![
-				vec!["n".to_string(), "17".to_string()],
-				vec!["n".to_string(), "9735".to_string()],
-			]),
+			tags: Some(vec![TagTuple::single("n", "17"), TagTuple::single("n", "9735")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1577,7 +1589,7 @@ mod tests {
 		let nut10 = Nut10SecretRequest {
 			kind: Kind::P2PK,
 			data: "02c3b5bb27e361457c92d93d78dd73d3d53732110b2cfe8b50fbc0abc615e9c331".to_string(),
-			tags: Some(vec![vec!["timeout".to_string(), "3600".to_string()]]),
+			tags: Some(vec![TagTuple::single("timeout", "3600")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1625,11 +1637,10 @@ mod tests {
 		let transport = Transport {
 			kind: TransportType::HttpPost,
 			target: "https://api.example.com/v1/payment".to_string(),
-			tags: Some(vec![vec![
-				"custom".to_string(),
-				"value1".to_string(),
-				"value2".to_string(),
-			]]),
+			tags: Some(vec![TagTuple::new(
+				"custom",
+				vec!["value1".to_string(), "value2".to_string()],
+			)]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1659,9 +1670,10 @@ mod tests {
 
 		// Verify custom tags are preserved
 		let tags = decoded.transports[0].tags.as_ref().unwrap();
-		assert!(tags
-			.iter()
-			.any(|t| t.len() >= 3 && t[0] == "custom" && t[1] == "value1" && t[2] == "value2"));
+		assert!(tags.iter().any(|t| t.key == "custom"
+			&& t.values.len() >= 2
+			&& t.values[0] == "value1"
+			&& t.values[1] == "value2"));
 	}
 
 	#[test]
@@ -1698,8 +1710,7 @@ mod tests {
 		let tags = decoded.transports[0].tags.as_ref().expect("should have tags");
 
 		// Check all three relays are present as "relay" tags
-		let relay_tags: Vec<&Vec<String>> =
-			tags.iter().filter(|t| !t.is_empty() && t[0] == "relay").collect();
+		let relay_tags: Vec<&TagTuple> = tags.iter().filter(|t| t.key == "relay").collect();
 		assert_eq!(relay_tags.len(), 3);
 
 		// Verify the nprofile is preserved (relays are encoded back into it)
@@ -1717,7 +1728,7 @@ mod tests {
 			kind: TransportType::Nostr,
 			target: "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24mayt8g2lcy6q"
 				.to_string(),
-			tags: Some(vec![vec!["n".to_string(), "17".to_string()]]),
+			tags: Some(vec![TagTuple::single("n", "17")]),
 		};
 		let t2 = Transport {
 			kind: TransportType::HttpPost,
@@ -1727,7 +1738,7 @@ mod tests {
 		let t3 = Transport {
 			kind: TransportType::HttpPost,
 			target: "https://api2.example.com/payment".to_string(),
-			tags: Some(vec![vec!["priority".to_string(), "backup".to_string()]]),
+			tags: Some(vec![TagTuple::single("priority", "backup")]),
 		};
 
 		let payment_request = CashuPaymentRequest {
@@ -1765,7 +1776,9 @@ mod tests {
 		assert_eq!(decoded.transports[2].kind, TransportType::HttpPost);
 		assert_eq!(decoded.transports[2].target, "https://api2.example.com/payment");
 		let tags = decoded.transports[2].tags.as_ref().unwrap();
-		assert!(tags.iter().any(|t| t.len() >= 2 && t[0] == "priority" && t[1] == "backup"));
+		assert!(tags
+			.iter()
+			.any(|t| t.key == "priority" && t.values.first().map(|s| s.as_str()) == Some("backup")));
 	}
 
 	#[test]
@@ -1883,12 +1896,11 @@ mod tests {
 			kind: Kind::HTLC,
 			data: "a]0e66820bfb412212cf7ab3deb0459ce282a1b04fda76ea6026a67e41ae26f3dc".to_string(),
 			tags: Some(vec![
-				vec!["locktime".to_string(), "1700000000".to_string()],
-				vec![
-					"refund".to_string(),
-					"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e"
-						.to_string(),
-				],
+				TagTuple::single("locktime", "1700000000"),
+				TagTuple::single(
+					"refund",
+					"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e",
+				),
 			]),
 		};
 
@@ -1930,13 +1942,13 @@ mod tests {
 		// Verify all tags with exact values
 		let tags = nut10.tags.as_ref().unwrap();
 		assert_eq!(tags.len(), 2);
-		assert_eq!(tags[0], vec!["locktime".to_string(), "1700000000".to_string()]);
+		assert_eq!(tags[0], TagTuple::single("locktime", "1700000000"));
 		assert_eq!(
 			tags[1],
-			vec![
-				"refund".to_string(),
-				"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e".to_string()
-			]
+			TagTuple::single(
+				"refund",
+				"033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e"
+			)
 		);
 	}
 
