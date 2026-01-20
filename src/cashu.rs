@@ -186,6 +186,83 @@ pub enum TransportType {
 	HttpPost,
 }
 
+/// A value in a TagTuple, stored inline to avoid heap allocation.
+/// Maximum length is 255 bytes (enforced by the TLV encoding).
+#[derive(Copy, Clone, Debug, Eq)]
+pub struct TagValue {
+	bytes: [u8; 255],
+	len: u8,
+}
+
+impl TagValue {
+	/// Create a new TagValue from a string slice.
+	pub fn new(s: &str) -> Result<Self, Error> {
+		let bytes = s.as_bytes();
+		if bytes.len() > u8::MAX as usize {
+			return Err(Error::InvalidLength);
+		}
+		let mut arr = [0u8; 255];
+		arr[..bytes.len()].copy_from_slice(bytes);
+		Ok(Self { bytes: arr, len: bytes.len() as u8 })
+	}
+
+	/// Returns the string slice.
+	pub fn as_str(&self) -> &str {
+		// We only construct from valid str in new()
+		core::str::from_utf8(&self.bytes[..self.len as usize])
+			.expect("TagValue contains valid UTF-8")
+	}
+
+	/// Returns the byte slice.
+	pub fn as_bytes(&self) -> &[u8] {
+		self.as_str().as_bytes()
+	}
+}
+
+impl Deref for TagValue {
+	type Target = str;
+
+	fn deref(&self) -> &Self::Target {
+		self.as_str()
+	}
+}
+
+impl AsRef<str> for TagValue {
+	fn as_ref(&self) -> &str {
+		self.as_str()
+	}
+}
+
+impl fmt::Display for TagValue {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
+impl PartialEq for TagValue {
+	fn eq(&self, other: &Self) -> bool {
+		self.as_str() == other.as_str()
+	}
+}
+
+impl PartialEq<str> for TagValue {
+	fn eq(&self, other: &str) -> bool {
+		self.as_str() == other
+	}
+}
+
+impl PartialEq<&str> for TagValue {
+	fn eq(&self, other: &&str) -> bool {
+		self.as_str() == *other
+	}
+}
+
+impl PartialEq<String> for TagValue {
+	fn eq(&self, other: &String) -> bool {
+		self.as_str() == other.as_str()
+	}
+}
+
 /// A tag tuple containing a key and zero or more values.
 ///
 /// This represents the generic tag format used in NUT-18/NUT-26 for both
@@ -196,33 +273,37 @@ pub struct TagTuple {
 	/// The tag key (e.g., "n" for NIPs, "relay" for relays, "locktime" for timelocks)
 	key: UnitString,
 	/// The tag values
-	values: Vec<String>,
+	values: Vec<TagValue>,
 }
 
 impl TagTuple {
 	/// Create a new tag tuple with a key and values.
 	///
 	/// Returns an error if the key or any value exceeds 255 bytes.
-	pub fn new(key: &str, values: Vec<String>) -> Result<Self, Error> {
+	pub fn new<I, S>(key: &str, values: I) -> Result<Self, Error>
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<str>,
+	{
 		if key.len() > u8::MAX as usize {
 			return Err(Error::InvalidLength);
 		}
-		for value in &values {
-			if value.len() > u8::MAX as usize {
-				return Err(Error::InvalidLength);
-			}
+		let values_iter = values.into_iter();
+		let mut tag_values = Vec::with_capacity(values_iter.size_hint().0);
+		for value in values_iter {
+			tag_values.push(TagValue::new(value.as_ref())?);
 		}
-		Ok(Self { key: UnitString::new(key), values })
+		Ok(Self { key: UnitString::new(key), values: tag_values })
 	}
 
 	/// Create a tag tuple with a single value.
 	///
 	/// Returns an error if the key or value exceeds 255 bytes.
 	pub fn single(key: &str, value: &str) -> Result<Self, Error> {
-		if key.len() > u8::MAX as usize || value.len() > u8::MAX as usize {
+		if key.len() > u8::MAX as usize {
 			return Err(Error::InvalidLength);
 		}
-		Ok(Self { key: UnitString::new(key), values: vec![value.to_string()] })
+		Ok(Self { key: UnitString::new(key), values: vec![TagValue::new(value)?] })
 	}
 
 	/// Returns the tag key.
@@ -231,7 +312,7 @@ impl TagTuple {
 	}
 
 	/// Returns the tag values.
-	pub fn values(&self) -> &[String] {
+	pub fn values(&self) -> &[TagValue] {
 		&self.values
 	}
 }
@@ -761,8 +842,7 @@ impl CashuPaymentRequest {
 			if key == "r" {
 				all_relays.extend(values.into_iter().map(String::from));
 			} else {
-				final_tags
-					.push(TagTuple::new(key, values.into_iter().map(String::from).collect())?);
+				final_tags.push(TagTuple::new(key, values)?);
 			}
 		}
 		if !all_relays.is_empty() {
@@ -797,7 +877,7 @@ impl CashuPaymentRequest {
 				if let Some(ref tags) = transport.tags {
 					for tag in tags {
 						if tag.key() == "relay" {
-							all_relays.extend(tag.values().iter().cloned());
+							all_relays.extend(tag.values().iter().map(|v| v.to_string()));
 						} else {
 							Self::encode_tag_tuple_into(tag, writer);
 						}
@@ -852,7 +932,7 @@ impl CashuPaymentRequest {
 				0x03 | 0x05 => {
 					// tag_tuple: generic tuple (repeatable)
 					let (key, values) = Self::decode_tag_tuple(value)?;
-					tags.push(TagTuple::new(key, values.into_iter().map(String::from).collect())?);
+					tags.push(TagTuple::new(key, values)?);
 				},
 				_ => {
 					// Unknown tags are ignored
@@ -1456,8 +1536,8 @@ mod tests {
 			.iter()
 			.any(|t| t.key == "n" && t.values.first().map(|s| s.as_str()) == Some("44")));
 		let relay_tag = tags2.iter().find(|t| t.key == "relay").expect("should have relay tag");
-		assert!(relay_tag.values.contains(&"wss://relay.damus.io".to_string()));
-		assert!(relay_tag.values.contains(&"wss://nos.lol".to_string()));
+		assert!(relay_tag.values.iter().any(|v| v == "wss://relay.damus.io"));
+		assert!(relay_tag.values.iter().any(|v| v == "wss://nos.lol"));
 	}
 
 	#[test]
