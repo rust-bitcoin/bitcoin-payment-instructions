@@ -282,8 +282,8 @@ impl PartialEq<String> for TagValue {
 /// In JSON, this is represented as `["key", "value1", "value2", ...]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagTuple {
-	/// The tag key (e.g., "n" for NIPs, "relay" for relays, "locktime" for timelocks)
-	key: UnitString,
+	/// The tag key (e.g., "n" for NIPs, "locktime" for timelocks)
+	key: TagValue,
 	/// The tag values
 	values: Vec<TagValue>,
 }
@@ -297,25 +297,21 @@ impl TagTuple {
 		I: IntoIterator<Item = S>,
 		S: AsRef<str>,
 	{
-		if key.len() > u8::MAX as usize {
-			return Err(Error::InvalidLength);
-		}
+		let key = TagValue::new(key)?;
 		let values_iter = values.into_iter();
 		let mut tag_values = Vec::with_capacity(values_iter.size_hint().0);
 		for value in values_iter {
 			tag_values.push(TagValue::new(value.as_ref())?);
 		}
-		Ok(Self { key: UnitString::new(key), values: tag_values })
+		Ok(Self { key, values: tag_values })
 	}
 
 	/// Create a tag tuple with a single value.
 	///
 	/// Returns an error if the key or value exceeds 255 bytes.
 	pub fn single(key: &str, value: &str) -> Result<Self, Error> {
-		if key.len() > u8::MAX as usize {
-			return Err(Error::InvalidLength);
-		}
-		Ok(Self { key: UnitString::new(key), values: vec![TagValue::new(value)?] })
+		let key = TagValue::new(key)?;
+		Ok(Self { key, values: vec![TagValue::new(value)?] })
 	}
 
 	/// Returns the tag key.
