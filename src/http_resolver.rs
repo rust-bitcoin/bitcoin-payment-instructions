@@ -124,9 +124,15 @@ struct LNURLCallbackResponse {
 
 const DNS_ERR: &'static str = "DNS Request to dns.google failed";
 
+/// DNS responses should, at max, contain a few public keys or a TXT record or two and some
+/// signatures. Each record can only be up to 16 KiB, though we don't expect to ever see a record
+/// that large, and certainly not more than one. Still, leave room for eight just-shy-of-max-sized
+/// TXT records and some sigs.
+const DNS_MAX_BODY_SIZE: usize = 128 * 1024;
+
 impl HTTPHrnResolver {
 	async fn http_get(&self, url: &str, accept_dns_message: bool) -> Result<Vec<u8>, ()> {
-		let mut req = bitreq::get(url);
+		let mut req = bitreq::get(url).with_max_body_size(Some(DNS_MAX_BODY_SIZE));
 		if accept_dns_message {
 			req = req.with_header("accept", "application/dns-message");
 		}

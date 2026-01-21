@@ -10,4 +10,5 @@
 extern crate bitcoin;
 extern crate bitcoin_payment_instructions;
 
+pub mod cashu;
 pub mod parse;

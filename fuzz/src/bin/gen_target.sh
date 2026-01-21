@@ -6,4 +6,5 @@ GEN_TEST() {
 	echo "void $1_run(const unsigned char* data, size_t data_len);" >> ../../targets.h
 }
 
+GEN_TEST cashu
 GEN_TEST parse

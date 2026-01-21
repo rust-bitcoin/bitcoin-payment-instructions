@@ -1,7 +1,7 @@
-This crate contains a basic parser for Bitcoin Payment Instructions.
+This crate contains a parser for Bitcoin Payment Instructions.
 
-It supports various encodings which you might encounter in QR codes,
-   typed/pasted into a text box, or opened via a system URI handler.
+It supports nearly all encodings which you might encounter in QR codes,
+typed/pasted into a text box, or opened via a system URI handler.
 
 Any missing Payment Instruction formats should be added as soon as there is a
 standard encoding for address formats, ideally using a Rust crate that (a) has
