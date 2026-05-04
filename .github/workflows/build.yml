@@ -98,6 +98,10 @@ jobs:
           cargo update -p syn --precise "2.0.106" --verbose
           cargo update -p quote --precise "1.0.41" --verbose
           cargo update -p proc-macro2 --precise "1.0.103" --verbose
+          cargo update -p libc --precise "0.2.183" --verbose
+          cargo update -p unicode-ident --precise "1.0.22" --verbose
+          cargo update -p honggfuzz --precise "0.5.58" --verbose
+          cargo update -p semver --precise "1.0.27" --verbose
           RUSTFLAGS="--cfg=fuzzing --cfg=secp256k1_fuzz --cfg=hashes_fuzz" cargo test --verbose --color always
           cargo clean
       - name: Run fuzzers
