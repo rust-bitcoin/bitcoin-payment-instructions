@@ -26,6 +26,8 @@ use lightning::util::logger::Logger;
 use crate::hrn_resolution::{
 	HrnResolution, HrnResolutionFuture, HrnResolver, HumanReadableName, LNURLResolutionFuture,
 };
+#[cfg(feature = "http")]
+use crate::http_resolver::HTTPHrnResolver;
 use crate::Amount;
 
 struct OsRng;
@@ -93,6 +95,11 @@ fn channel() -> (ChannelSend, ChannelRecv) {
 /// query message goes out in a timely manner. You can call [`Self::register_post_queue_action`] to
 /// have this happen automatically.
 ///
+/// An optional [`HTTPHrnResolver`] fallback can be enabled via [`Self::new_with_http_fallback`].
+/// It is used when the onion-message DNSSEC path cannot be attempted (for example, when no
+/// DNS-resolving nodes are known in the network graph) and is the only path used for LNURL
+/// resolution, which is not supported by the onion-message resolver itself.
+///
 /// [`PeerManager::process_events`]: lightning::ln::peer_handler::PeerManager::process_events
 pub struct LDKOnionMessageDNSSECHrnResolver<N: Deref<Target = NetworkGraph<L>>, L: Deref>
 where
@@ -104,6 +111,8 @@ where
 	pending_resolutions: Mutex<HashMap<HumanReadableName, Vec<(PaymentId, ChannelSend)>>>,
 	message_queue: Mutex<Vec<(DNSResolverMessage, MessageSendInstructions)>>,
 	pm_event_poker: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
+	#[cfg(feature = "http")]
+	fallback: Option<HTTPHrnResolver>,
 }
 
 impl<N: Deref<Target = NetworkGraph<L>>, L: Deref> LDKOnionMessageDNSSECHrnResolver<N, L>
@@ -117,11 +126,32 @@ where
 		Self {
 			network_graph,
 			next_id: AtomicUsize::new(0),
-			// TODO: Swap for `new_without_expiry_validation` when we upgrade to LDK 0.2
-			resolver: OMNameResolver::new(0, 0),
+			resolver: OMNameResolver::new_without_no_std_expiry_validation(),
 			pending_resolutions: Mutex::new(HashMap::new()),
 			message_queue: Mutex::new(Vec::new()),
 			pm_event_poker: RwLock::new(None),
+			#[cfg(feature = "http")]
+			fallback: None,
+		}
+	}
+
+	/// Constructs a new [`LDKOnionMessageDNSSECHrnResolver`] with a fallback [`HTTPHrnResolver`].
+	///
+	/// The fallback is consulted whenever the onion-message DNSSEC path cannot be attempted
+	/// (e.g. no DNS-resolving nodes are known in the network graph) and is also used to satisfy
+	/// LNURL resolution, which the onion-message resolver does not itself support.
+	///
+	/// See the struct-level documentation for more info.
+	#[cfg(feature = "http")]
+	pub fn new_with_http_fallback(network_graph: N) -> Self {
+		Self {
+			network_graph,
+			next_id: AtomicUsize::new(0),
+			resolver: OMNameResolver::new_without_no_std_expiry_validation(),
+			pending_resolutions: Mutex::new(HashMap::new()),
+			message_queue: Mutex::new(Vec::new()),
+			pm_event_poker: RwLock::new(None),
+			fallback: Some(HTTPHrnResolver::new()),
 		}
 	}
 
@@ -133,16 +163,24 @@ where
 		*self.pm_event_poker.write().unwrap() = Some(callback);
 	}
 
+	/// Begins resolving `hrn` via onion-message DNSSEC.
+	///
+	/// On failure, returns the error string along with a `should_fallback` flag indicating
+	/// whether the caller should attempt the HTTP fallback. It is only set when the
+	/// onion-message path could not be attempted at all (e.g. no DNS-resolving nodes are
+	/// known); errors that indicate a real problem (bad system clock, malformed HRN) are
+	/// reported as-is so that callers see them rather than masking them with HTTP.
 	fn init_resolve_hrn<'a>(
 		&'a self, hrn: &HumanReadableName,
-	) -> Result<ChannelRecv, &'static str> {
+	) -> Result<ChannelRecv, (&'static str, bool)> {
 		#[cfg(feature = "std")]
 		{
 			use std::time::SystemTime;
 			let clock_err =
 				"DNSSEC validation relies on having a correct system clock. It is currently set before 1970.";
-			let now =
-				SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|_| clock_err)?;
+			let now = SystemTime::now()
+				.duration_since(SystemTime::UNIX_EPOCH)
+				.map_err(|_| (clock_err, false))?;
 			// Use `now / 60` as the block height to expire pending requests after 1-2 minutes.
 			self.resolver.new_best_block((now.as_secs() / 60) as u32, now.as_secs() as u32);
 		}
@@ -168,9 +206,10 @@ where
 			}
 		}
 		if dns_resolvers.is_empty() {
-			return Err(
+			return Err((
 				"Failed to find any DNS resolving nodes, check your network graph is synced",
-			);
+				true,
+			));
 		}
 
 		let counter = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
@@ -182,7 +221,7 @@ where
 		// TODO: Once LDK 0.2 ships with a new context authentication method, we shouldn't need the
 		// RNG here and can stop depending on std.
 		let (query, dns_context) =
-			self.resolver.resolve_name(payment_id, *hrn, &OsRng).map_err(|_| err)?;
+			self.resolver.resolve_name(payment_id, *hrn, &OsRng).map_err(|_| (err, false))?;
 		let context = MessageContext::DNSResolver(dns_context);
 
 		let (send, recv) = channel();
@@ -266,19 +305,49 @@ where
 {
 	fn resolve_hrn<'a>(&'a self, hrn: &'a HumanReadableName) -> HrnResolutionFuture<'a> {
 		match self.init_resolve_hrn(hrn) {
-			Err(e) => Box::pin(async move { Err(e) }),
+			Err((e, _should_fallback)) => {
+				#[cfg(feature = "http")]
+				{
+					if _should_fallback {
+						if let Some(fallback) = &self.fallback {
+							return fallback.resolve_hrn(hrn);
+						}
+					}
+				}
+				Box::pin(async move { Err(e) })
+			},
 			Ok(recv) => Box::pin(async move { Ok(recv.await) }),
 		}
 	}
 
-	fn resolve_lnurl<'a>(&'a self, _url: &'a str) -> HrnResolutionFuture<'a> {
+	#[cfg_attr(not(feature = "http"), allow(unused))]
+	fn resolve_lnurl<'a>(&'a self, url: &'a str) -> HrnResolutionFuture<'a> {
+		#[cfg(feature = "http")]
+		{
+			if let Some(fallback) = &self.fallback {
+				return fallback.resolve_lnurl(url);
+			}
+		}
+
 		let err = "DNS resolver does not support LNURL resolution";
 		Box::pin(async move { Err(err) })
 	}
 
+	#[cfg_attr(not(feature = "http"), allow(unused))]
 	fn resolve_lnurl_to_invoice<'a>(
-		&'a self, _: String, _: Amount, _: [u8; 32],
+		&'a self, callback: String, amount: Amount, expected_description_hash: [u8; 32],
 	) -> LNURLResolutionFuture<'a> {
+		#[cfg(feature = "http")]
+		{
+			if let Some(fallback) = &self.fallback {
+				return fallback.resolve_lnurl_to_invoice(
+					callback,
+					amount,
+					expected_description_hash,
+				);
+			}
+		}
+
 		let err = "resolve_lnurl_to_invoice shouldn't be called when we don't resolve LNURL";
 		debug_assert!(false, "{err}");
 		Box::pin(async move { Err(err) })
