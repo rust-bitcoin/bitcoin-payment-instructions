@@ -22,6 +22,12 @@ RUSTC_MINOR_VERSION=$(rustc --version | awk '{ split($2,a,"."); print a[2] }')
 # Starting with version 1.0.104, the `proc-macro2` crate has an MSRV of rustc 1.68
 [ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p proc-macro2 --precise "1.0.103" --verbose
 
+# Starting with version 0.2.184, the `libc` crate has an MSRV of rustc 1.65
+[ "$RUSTC_MINOR_VERSION" -lt 65 ] && cargo update -p libc --precise "0.2.183" --verbose
+
+# Starting with version 1.0.23, the `unicode-ident` crate has an MSRV of rustc 1.71
+[ "$RUSTC_MINOR_VERSION" -lt 71 ] && cargo update -p unicode-ident --precise "1.0.22" --verbose
+
 export RUST_BACKTRACE=1
 
 cargo check --verbose --color always
