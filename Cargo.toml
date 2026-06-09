@@ -8,6 +8,7 @@ description = """
 A parser for arbitrary bitcoin payment instructions.
 """
 edition = "2021"
+rust-version = "1.63.0"
 
 [package.metadata.docs.rs]
 features = ["std", "http"]
